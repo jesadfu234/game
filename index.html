@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>game — project launcher</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{
+    min-height:100vh;background:#06060b;color:#e8e8f0;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    padding:32px 20px;gap:28px;
+  }
+  h1{font-size:clamp(22px,5vw,34px);font-weight:900;letter-spacing:.02em}
+  p.sub{color:#5b5b7a;font-size:12px;letter-spacing:.14em;text-transform:uppercase;text-align:center}
+  .cards{display:flex;gap:18px;flex-wrap:wrap;justify-content:center;width:100%;max-width:760px}
+  a.card{
+    flex:1 1 300px;text-decoration:none;color:inherit;
+    border:1px solid #1e1e30;border-radius:14px;padding:22px;
+    background:linear-gradient(160deg,#101020,#0a0a14);
+    transition:border-color .18s,transform .18s;
+  }
+  a.card:hover{border-color:#3a3a5e;transform:translateY(-2px)}
+  a.card .tag{font-size:10px;letter-spacing:.16em;color:#5b5b7a;text-transform:uppercase}
+  a.card .name{font-size:23px;font-weight:900;margin:8px 0 10px}
+  a.card .desc{font-size:12.5px;line-height:1.6;color:#9292b0}
+  .zenith .name{color:#ffdf7a}
+  .proto .name{color:#3ddc97}
+  footer{font-size:11px;color:#3d3d58;text-align:center;line-height:1.8}
+  footer code{color:#7aa2ff}
+</style>
+</head>
+<body>
+  <div style="text-align:center">
+    <h1>ZENITH</h1>
+    <p class="sub">one button · every block is a note</p>
+  </div>
+
+  <div class="cards">
+    <a class="card zenith" href="zenith/">
+      <div class="tag">Playable</div>
+      <div class="name">ZENITH →</div>
+      <div class="desc">
+        The game. Land blocks dead centre to keep your tower wide. Climb into
+        new biomes where the music changes key. One tap, no tutorial.
+      </div>
+    </a>
+    <a class="card proto" href="prototype/">
+      <div class="tag">Prototype</div>
+      <div class="name">RIFT →</div>
+      <div class="desc">
+        The first core-loop proof — a one-button timing bar. Kept because it
+        isolates the timing mechanic with no art or progression.
+      </div>
+    </a>
+  </div>
+
+  <footer>
+    Design derived from published retention research — see <code>GAME-DESIGN.md</code><br>
+    and <code>RESEARCH-addictive-design.md</code>
+  </footer>
+</body>
+</html>

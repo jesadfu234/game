@@ -1,0 +1,964 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#06060b">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>ZENITH</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;
+    -webkit-user-select:none;user-select:none}
+  html,body{height:100%;overflow:hidden;background:#06060b;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#f2f2f8;
+    overscroll-behavior:none;touch-action:none}
+  canvas{display:block;width:100%;height:100%;touch-action:none;cursor:pointer}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* ═══════════════════════════════════════════════════════════════════════════
+   ZENITH
+   A precision tower. Every block you land is a note. Every biome is a new key.
+
+   Design sources (see RESEARCH-addictive-design.md):
+     §2.2  dopamine peaks on anticipation, not receipt -> ceremony before payoff
+     §2.3  reward variability sustains compulsion; difficulty must track skill
+     §2.4  compulsion loop = degrade efficiency, then show an EARNED path back
+     §6    three nested loops (core / progression / meta)
+     §11   juice: hit-stop, shake scaled to weight, particles along strike vector
+     CHI'24 (n=1699): curiosity is the dominant predictor of enjoyment
+     Thumper study: rhythm games induce flow; time distortion is flow's core
+   ═══════════════════════════════════════════════════════════════════════════ */
+(() => {
+'use strict';
+
+/* ── accessibility ──────────────────────────────────────────────────────── */
+const REDUCED = window.matchMedia &&
+  window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const MOTION = REDUCED ? 0.22 : 1;
+
+/* ── tuning ─────────────────────────────────────────────────────────────── */
+const CFG = {
+  BASE_W:      4.20,   // starting block width (world units)
+  MIN_W:       0.42,   // below this the run is effectively over
+  DEPTH:       3.60,   // block depth
+  BLOCK_H:     1.00,   // one block tall
+  /* Graded success (CHI'24: "graded success" is a precondition of positive
+     low-level UX). Three tiers stop the perfect window being a binary cliff. */
+  PERFECT:     0.130,  // keep width, build combo, regrow every 3rd
+  GREAT:       0.420,  // keep the combo alive, but the tower still narrows
+  SWEEP:       3.30,   // half-range the block travels
+  SPEED_0:     2.05,   // world units / second
+  SPEED_K:     0.055,  // speed gain per level
+  SPEED_MAX:   6.60,
+  REGROW:      0.16,   // width regained every 3rd consecutive perfect
+  BIOME_EVERY: 11,     // levels per biome
+  HITSTOP:     0.055,  // seconds of freeze on land (research: 40-80ms)
+  HITSTOP_PERF:0.095,
+};
+
+/* ── biomes: palette + musical key, cycled with rising intensity ────────── */
+const BIOMES = [
+  { name:'DAWN',    sub:'where it begins',
+    sky:['#1a0f1e','#3d1b33','#7a3350'], accent:'#ffb27a', glow:'#ffd9a8',
+    scale:[0,2,4,7,9],   root:220.00, timbre:'sine',     dust:'#ffcf9e' },
+  { name:'AURORA',  sub:'the lights wake',
+    sky:['#04141c','#0a3c45','#12857e'], accent:'#5ff0c8', glow:'#b6fff0',
+    scale:[0,3,5,7,10],  root:246.94, timbre:'triangle', dust:'#8ffff0' },
+  { name:'NEBULA',  sub:'nothing is solid',
+    sky:['#120626','#341059','#6b1f9e'], accent:'#c48cff', glow:'#e6ccff',
+    scale:[0,2,5,7,10],  root:261.63, timbre:'triangle', dust:'#d4b3ff' },
+  { name:'STRATOS', sub:'above the weather',
+    sky:['#031024','#0d3160','#1c6bb0'], accent:'#7ec8ff', glow:'#dbeeff',
+    scale:[0,3,7,10,14], root:293.66, timbre:'square',   dust:'#a9dcff' },
+  { name:'VOID',    sub:'it is very quiet here',
+    sky:['#03030a','#0d0a24','#221650'], accent:'#8f7bff', glow:'#cfc4ff',
+    scale:[0,1,5,7,8],   root:311.13, timbre:'sine',     dust:'#b6a8ff' },
+  { name:'ZENITH',  sub:'you made it',
+    sky:['#1a1406','#4a3708','#a8821a'], accent:'#ffdf7a', glow:'#fff6cf',
+    scale:[0,4,7,11,14], root:329.63, timbre:'sine',     dust:'#fff0b8' },
+];
+
+function biomeAt(level) {
+  const i = Math.floor(level / CFG.BIOME_EVERY);
+  const b = BIOMES[i % BIOMES.length];
+  const cycle = Math.floor(i / BIOMES.length);
+  return { ...b, index: i, cycle,
+    // later cycles: brighter, faster, higher
+    root: b.root * Math.pow(1.06, cycle) };
+}
+
+/* ── persistence (sandboxed iframes may block storage) ──────────────────── */
+const SAVE = {
+  best: 0, bestCombo: 0, stacks: 0, runs: 0,
+  seen: {}, lastDay: '', streak: 0,
+  load() {
+    try {
+      const raw = localStorage.getItem('zenith.v1');
+      if (raw) Object.assign(this, JSON.parse(raw));
+    } catch (e) {}
+  },
+  save() {
+    try {
+      localStorage.setItem('zenith.v1', JSON.stringify({
+        best: this.best, bestCombo: this.bestCombo, stacks: this.stacks,
+        runs: this.runs, seen: this.seen, lastDay: this.lastDay, streak: this.streak,
+      }));
+    } catch (e) {}
+  },
+  registerDay() {
+    const d = new Date(), today = d.toDateString();
+    if (this.lastDay === today) return false;
+    const y = new Date(d.getTime() - 864e5).toDateString();
+    this.streak = (this.lastDay === y) ? (this.streak + 1) : 1;
+    this.lastDay = today; this.save();
+    return true;              // returns true on a fresh day -> celebrate
+  },
+};
+SAVE.load();
+
+/* ═══ AUDIO ENGINE ════════════════════════════════════════════════════════
+   Fully procedural. Each stack is a note ascending a pentatonic scale, so a
+   clean run literally becomes a rising melody. Perfects add the fifth.
+   ──────────────────────────────────────────────────────────────────────── */
+const Audio = (() => {
+  let ctx = null, master = null, padGain = null, padOsc = [], padFilter = null;
+  let ready = false, muted = false;
+
+  function init() {
+    if (ready) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    try { ctx = new AC(); } catch (e) { return; }
+
+    master = ctx.createGain();
+    master.gain.value = 0.85;
+    master.connect(ctx.destination);
+
+    // simple algorithmic reverb: short delay feedback into a lowpass
+    const dly = ctx.createDelay(1.0); dly.delayTime.value = 0.17;
+    const fb  = ctx.createGain();     fb.gain.value = 0.28;
+    const lp  = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 2200;
+    const wet = ctx.createGain();     wet.gain.value = 0.34;
+    dly.connect(lp); lp.connect(fb); fb.connect(dly); dly.connect(wet);
+    wet.connect(master);
+    master.__reverb = dly;
+
+    padFilter = ctx.createBiquadFilter();
+    padFilter.type = 'lowpass'; padFilter.frequency.value = 800;
+    padGain = ctx.createGain(); padGain.gain.value = 0.0;
+    padFilter.connect(padGain); padGain.connect(master); padGain.connect(dly);
+    ready = true;
+  }
+
+  function resume() { if (ctx && ctx.state === 'suspended') ctx.resume(); }
+
+  /* one voice */
+  function voice(freq, dur, type, gain, detune, when) {
+    if (!ready || muted) return;
+    const t = (when || ctx.currentTime);
+    const o = ctx.createOscillator(), g = ctx.createGain(), f = ctx.createBiquadFilter();
+    o.type = type || 'sine';
+    o.frequency.value = freq;
+    if (detune) o.detune.value = detune;
+    f.type = 'lowpass'; f.frequency.value = Math.min(freq * 7 + 900, 9000);
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(gain, t + 0.008);       // fast attack
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(f); f.connect(g); g.connect(master);
+    if (master.__reverb) g.connect(master.__reverb);
+    o.start(t); o.stop(t + dur + 0.03);
+  }
+
+  /* noise burst - the "thud" of a block landing */
+  function thud(gain, cutoff) {
+    if (!ready || muted) return;
+    const n = Math.floor(ctx.sampleRate * 0.13);
+    const buf = ctx.createBuffer(1, n, ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / n, 3.2);
+    const s = ctx.createBufferSource(); s.buffer = buf;
+    const f = ctx.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = cutoff || 420;
+    const g = ctx.createGain(); g.gain.value = gain;
+    s.connect(f); f.connect(g); g.connect(master);
+    s.start();
+  }
+
+  /* scale degree -> frequency. level 1 lands on the root so the melody
+     starts at home and climbs: each successful stack is the next note. */
+  function noteFor(level, biome) {
+    const i = Math.max(0, level - 1);
+    const oct = Math.floor(i / biome.scale.length);
+    const deg = biome.scale[i % biome.scale.length];
+    return biome.root * Math.pow(2, (deg + oct * 12) / 12);
+  }
+
+  function startPad(biome) {
+    if (!ready) return;
+    stopPad();
+    const t = ctx.currentTime;
+    const freqs = [biome.root / 2, biome.root / 2 * Math.pow(2, 7 / 12)];
+    freqs.forEach((fr, i) => {
+      const o = ctx.createOscillator();
+      o.type = 'sine'; o.frequency.value = fr;
+      o.detune.value = (i ? 6 : -5);
+      o.connect(padFilter); o.start(t);
+      padOsc.push(o);
+    });
+    padGain.gain.cancelScheduledValues(t);
+    padGain.gain.setValueAtTime(padGain.gain.value, t);
+    padGain.gain.linearRampToValueAtTime(0.075, t + 1.6);
+    padFilter.frequency.cancelScheduledValues(t);
+    padFilter.frequency.setValueAtTime(500, t);
+    padFilter.frequency.linearRampToValueAtTime(1400, t + 2.0);
+  }
+  function stopPad() {
+    padOsc.forEach(o => { try { o.stop(); } catch (e) {} });
+    padOsc = [];
+  }
+
+  return {
+    init, resume,
+    get ready() { return ready; },
+    get muted() { return muted; },
+    toggleMute() {
+      muted = !muted;
+      if (master) master.gain.value = muted ? 0 : 0.85;
+      return muted;
+    },
+
+    /* a landed block — three tiers, three different sounds */
+    land(level, biome, perfect, great, combo) {
+      if (!ready || muted) return;
+      const base = noteFor(level, biome);
+      thud(perfect ? 0.30 : (great ? 0.25 : 0.22), perfect ? 700 : 400);
+      voice(base, perfect ? 0.85 : 0.45, biome.timbre, perfect ? 0.20 : 0.13);
+      if (great && !perfect) voice(base * 1.5, 0.30, 'sine', 0.055);   // a lift, not a chord
+      if (perfect) {
+        voice(base * 1.5,  0.70, 'sine', 0.10, 0);            // the fifth
+        voice(base * 2,    1.00, 'sine', 0.055, 0);           // the octave
+        // combo shimmer, rising with the streak
+        const sh = Math.min(combo, 12);
+        voice(base * 3 * Math.pow(1.06, sh), 0.34, 'sine', 0.05);
+      }
+    },
+
+    /* slicing a block off */
+    slice() { if (ready && !muted) thud(0.16, 1600); },
+
+    /* biome transition - a resolving chord, the reward for climbing */
+    biome(biome) {
+      if (!ready || muted) return;
+      const r = biome.root;
+      [0, 4, 7, 12].forEach((s, i) => {
+        voice(r * Math.pow(2, s / 12), 1.6 - i * 0.12, 'sine', 0.085, 0, ctx.currentTime + i * 0.07);
+      });
+      startPad(biome);
+    },
+
+    /* failure */
+    fall() {
+      if (!ready || muted) return;
+      const t = ctx.currentTime;
+      [0, 3, 7, 10, 14].forEach((s, i) => {
+        voice(220 * Math.pow(2, -s / 12), 0.75, 'triangle', 0.10, 0, t + i * 0.075);
+      });
+      thud(0.5, 220);
+      startPad(BIOMES[0]);
+    },
+  };
+})();
+
+/* ═══ CANVAS ══════════════════════════════════════════════════════════════ */
+const cvs = document.getElementById('c');
+const ctx = cvs.getContext('2d');
+let W = 0, H = 0, DPR = 1, SCALE = 46, CX = 0, CY = 0, ISO_C = 0.866, ISO_S = 0.5;
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = Math.max(window.innerWidth, 240);
+  H = Math.max(window.innerHeight, 320);
+  cvs.width = Math.floor(W * DPR); cvs.height = Math.floor(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  CX = W / 2; CY = H * 0.74;
+  // fit the widest the world ever gets
+  SCALE = Math.min(W / 9.4, H / 11.2);
+}
+window.addEventListener('resize', resize, { passive: true });
+resize();
+
+/* isometric projection */
+function proj(x, y, z, camY) {
+  const yy = y - camY;
+  return {
+    sx: CX + (x - z) * ISO_C * SCALE,
+    sy: CY - yy * SCALE + (x + z) * ISO_S * SCALE,
+  };
+}
+/* returns hex so it can be chained (shade(shade(x,10),-4)) */
+function shade(hex, amt) {
+  const n = parseInt(hex.slice(1), 16);
+  const c = v => Math.max(0, Math.min(255, Math.round(v + amt))).toString(16).padStart(2, '0');
+  return '#' + c((n >> 16) & 255) + c((n >> 8) & 255) + c(n & 255);
+}
+
+/* ═══ GAME STATE ══════════════════════════════════════════════════════════ */
+const G = {
+  phase: 'title',        // title | play | over
+  stack: [],             // landed blocks
+  block: null,           // the moving block
+  level: 0,
+  camY: 0, camTarget: 0,
+  combo: 0, bestComboRun: 0, perfects: 0,
+  score: 0, height: 0,
+  speed: CFG.SPEED_0,
+  hitstop: 0, shake: 0, flash: 0, glory: 0,
+  biome: biomeAt(0), shownBiome: -1,
+  bannerT: 0, bannerName: '', bannerSub: '',
+  debris: [], parts: [], rings: [], pops: [], dust: [],
+  t: 0, deadFor: 0,
+  newBest: false, isNewDay: false, started: false,
+  lastMs: 0, fps: 0,
+};
+
+/* background dust motes */
+function seedDust() {
+  G.dust = [];
+  for (let i = 0; i < (REDUCED ? 26 : 70); i++) {
+    G.dust.push({ x: Math.random(), y: Math.random(),
+      s: 0.4 + Math.random() * 1.8, sp: 0.004 + Math.random() * 0.02,
+      o: 0.08 + Math.random() * 0.3 });
+  }
+}
+seedDust();
+
+/* ═══ SPAWNING ═══════════════════════════════════════════════════════════ */
+function spawnBlock() {
+  const top = G.stack[G.stack.length - 1];
+  const w = top.w;
+  const fromLeft = (G.level % 2 === 0);
+  G.block = {
+    w, x: fromLeft ? -CFG.SWEEP : CFG.SWEEP - w,
+    dir: fromLeft ? 1 : -1,
+    squash: 0, born: 0,
+  };
+  G.speed = Math.min(CFG.SPEED_0 + G.level * CFG.SPEED_K, CFG.SPEED_MAX);
+}
+
+function startRun() {
+  G.phase = 'play';
+  G.combo = 0; G.bestComboRun = 0; G.perfects = 0;
+  G.score = 0; G.level = 0; G.deadFor = 0; G.newBest = false;
+  G.debris = []; G.parts = []; G.rings = []; G.pops = [];
+  G.hitstop = 0; G.shake = 0; G.flash = 0; G.glory = 0;
+  G.shownBiome = -1;
+  G.stack = [{ x: -CFG.BASE_W / 2, w: CFG.BASE_W, level: -1, sq: 0 }];
+  G.camY = 0; G.camTarget = 0;
+  G.biome = biomeAt(0);
+  G.bannerT = 2.4; G.bannerName = G.biome.name; G.bannerSub = G.biome.sub;
+  G.shownBiome = 0;
+  spawnBlock();
+  if (!G.started) { G.started = true; G.isNewDay = SAVE.registerDay(); }
+  SAVE.runs++; SAVE.save();
+  Audio.init(); Audio.resume(); Audio.biome(G.biome);
+}
+
+/* ═══ THE ONE INPUT ══════════════════════════════════════════════════════ */
+function input() {
+  Audio.init(); Audio.resume();
+
+  if (G.phase === 'title') { startRun(); return; }
+  if (G.phase === 'over') {
+    if (G.deadFor > 0.45) startRun();
+    return;
+  }
+  drop();
+}
+
+function drop() {
+  const b = G.block;
+  if (!b) return;
+  const top = G.stack[G.stack.length - 1];
+
+  const l = Math.max(b.x, top.x);
+  const r = Math.min(b.x + b.w, top.x + top.w);
+  const overlap = r - l;
+
+  /* ── failure ── */
+  if (overlap <= 0.05) {
+    G.block = null;
+    gameOver();
+    return;
+  }
+
+  const offset = b.x - top.x;
+  const ad = Math.abs(offset);
+  const perfect = ad < CFG.PERFECT;
+  const great = !perfect && ad < CFG.GREAT;
+
+  /* ── place it ── */
+  const placed = { x: l, w: overlap, level: G.level, sq: 0, fresh: 1 };
+  G.stack.push(placed);
+  G.level++;
+  SAVE.stacks++;
+  /* HEIGHT is simply how high you got. Rewarding precision with *survival*
+     rather than with a second score keeps the number honest and legible —
+     and the tower staying wide IS the reward for a perfect stack. */
+  G.score = G.level;
+
+  /* ── slice debris: the overhang falls, along the strike vector (§11) ── */
+  if (overlap < b.w - 0.012) {
+    const leftCut  = b.x - l;                       // >0 if block hung off the left
+    const rightCut = (l + overlap) - (b.x + b.w);   // >0 if it hung off the right
+    const cutW = Math.abs(leftCut) > Math.abs(rightCut) ? leftCut : rightCut;
+    const cutX = cutW > 0 ? b.x : l + overlap;
+    if (Math.abs(cutW) > 0.05) {
+      G.debris.push({ x: cutX, w: Math.abs(cutW), y: G.level,
+        vx: (cutW > 0 ? -1 : 1) * (1.1 + Math.random() * 0.8),
+        vy: 0.6, rot: 0, vr: (cutW > 0 ? -1 : 1) * (1.4 + Math.random()),
+        a: 1 });
+      Audio.slice();
+    }
+  }
+
+  /* ── judge ── */
+  if (perfect) {
+    G.perfects++; G.combo++;
+    G.bestComboRun = Math.max(G.bestComboRun, G.combo);
+    G.hitstop = CFG.HITSTOP_PERF;
+    G.shake = 13 * MOTION; G.flash = 0.30 * MOTION; G.glory = 0.75;
+    // earned path back to baseline (§2.4) — never purchasable, always skill
+    if (G.combo % 3 === 0) {
+      const grew = Math.min(placed.w + CFG.REGROW, CFG.BASE_W);
+      placed.x -= (grew - placed.w) / 2;
+      placed.w = grew;
+    }
+    G.pops.push({ x: placed.x + placed.w / 2, y: G.level,
+      text: G.combo >= 3 ? 'PERFECT ×' + G.combo : 'PERFECT',
+      sub: '', hue: 44, t: 0, life: 1.0, big: true });
+    perfectBurst(placed);
+    ring(placed);
+  } else if (great) {
+    /* the middle tier: your streak survives, but the tower does not regrow.
+       This is the tier that stops the perfect window being all-or-nothing. */
+    G.combo++;
+    G.bestComboRun = Math.max(G.bestComboRun, G.combo);
+    G.hitstop = CFG.HITSTOP;
+    G.shake = 7 * MOTION; G.flash = 0.10 * MOTION;
+    G.pops.push({ x: placed.x + placed.w / 2, y: G.level,
+      text: 'GREAT', sub: '', hue: 168, t: 0, life: 0.72, big: false });
+    landParts(placed);
+  } else {
+    G.combo = 0;
+    G.hitstop = CFG.HITSTOP;
+    G.shake = 4.5 * MOTION;
+    landParts(placed);
+  }
+
+  Audio.land(G.level, G.biome, perfect, great, G.combo);
+
+  /* ── biome progression: the curiosity engine ── */
+  const nb = biomeAt(G.level);
+  if (nb.index !== G.shownBiome) {
+    G.biome = nb; G.shownBiome = nb.index;
+    G.bannerT = 2.6; G.bannerName = nb.name; G.bannerSub = nb.sub;
+    G.flash = 0.42 * MOTION; G.glory = 1;
+    SAVE.seen[nb.name] = true;
+    if (G.level > 0) Audio.biome(nb);
+  }
+
+  if (placed.w <= CFG.MIN_W) { G.block = null; gameOver(); return; }
+
+  G.camTarget = G.level;
+  G.block = null;
+  spawnBlock();
+}
+
+function gameOver() {
+  G.phase = 'over'; G.deadFor = 0;
+  G.shake = 26 * MOTION; G.flash = 0.6 * MOTION;
+  Audio.fall();
+  if (G.score > SAVE.best) { SAVE.best = G.score; G.newBest = true; }
+  if (G.bestComboRun > SAVE.bestCombo) SAVE.bestCombo = G.bestComboRun;
+  SAVE.save();
+  // the tower tumbles
+  G.stack.forEach((s, i) => {
+    if (i === 0) return;
+    G.debris.push({ x: s.x, w: s.w, y: s.level,
+      vx: (Math.random() - 0.2) * 1.6, vy: 0.4 + Math.random() * 0.5,
+      rot: 0, vr: (Math.random() - 0.5) * 3.4, a: 1, tower: true });
+  });
+}
+
+/* ═══ PARTICLES ══════════════════════════════════════════════════════════ */
+function landParts(b) {
+  const n = REDUCED ? 3 : 9;
+  for (let i = 0; i < n; i++) {
+    G.parts.push({ x: b.x + Math.random() * b.w, y: b.level + 0.05,
+      z: (Math.random() - 0.5) * CFG.DEPTH,
+      vx: (Math.random() - 0.5) * 1.4, vy: 0.5 + Math.random() * 1.1,
+      vz: (Math.random() - 0.5) * 0.8,
+      life: 0.5 + Math.random() * 0.4, t: 0, size: 1.4 + Math.random() * 1.6 });
+  }
+}
+function perfectBurst(b) {
+  const n = REDUCED ? 8 : 30;
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 1.4 + Math.random() * 3.4;
+    G.parts.push({ x: b.x + b.w / 2, y: b.level + 0.05, z: 0,
+      vx: Math.cos(a) * sp, vy: 1.5 + Math.random() * 3.6, vz: Math.sin(a) * sp * 0.7,
+      life: 0.6 + Math.random() * 0.7, t: 0, size: 1.7 + Math.random() * 2.6, gold: true });
+  }
+}
+function ring(b) {
+  if (REDUCED) return;
+  G.rings.push({ x: b.x + b.w / 2, y: b.level + 0.06, r: 0.1, t: 0, life: 0.62 });
+}
+
+/* ═══ UPDATE ═════════════════════════════════════════════════════════════ */
+function update(dt) {
+  G.t += dt;
+
+  /* hit-stop: freeze the world for a beat to sell the impact (§11) */
+  if (G.hitstop > 0) {
+    G.hitstop -= dt;
+    G.shake *= Math.pow(0.02, dt);
+    G.flash *= Math.pow(0.004, dt);
+    decayParticles(dt * 0.18);
+    return;
+  }
+
+  if (G.phase === 'play' && G.block) {
+    const b = G.block;
+    b.x += b.dir * G.speed * dt;
+    if (b.x + b.w >  CFG.SWEEP) { b.x = CFG.SWEEP - b.w; b.dir = -1; }
+    if (b.x < -CFG.SWEEP)      { b.x = -CFG.SWEEP;      b.dir =  1; }
+  }
+  if (G.phase === 'over') G.deadFor += dt;
+
+  /* camera: lag behind so height feels earned */
+  G.camTarget = G.phase === 'over' ? G.camTarget : Math.max(0, G.level - 4.2);
+  G.camY += (G.camTarget - G.camY) * Math.min(1, dt * 4.4);
+
+  G.shake *= Math.pow(0.0016, dt);
+  G.flash *= Math.pow(0.0012, dt);
+  G.glory *= Math.pow(0.02, dt);
+  if (G.bannerT > 0) G.bannerT -= dt;
+
+  /* stack squash-and-stretch */
+  for (const s of G.stack) if (s.sq > 0) s.sq = Math.max(0, s.sq - dt * 5.5);
+
+  decayParticles(dt);
+
+  /* debris */
+  for (let i = G.debris.length - 1; i >= 0; i--) {
+    const d = G.debris[i];
+    d.vy -= 9.4 * dt; d.y += d.vy * dt; d.x += d.vx * dt;
+    d.rot += d.vr * dt;
+    if (d.y < -1.6) { d.a -= dt * 1.6; }
+    if (d.a <= 0) G.debris.splice(i, 1);
+  }
+
+  /* rings */
+  for (let i = G.rings.length - 1; i >= 0; i--) {
+    const r = G.rings[i]; r.t += dt;
+    r.r = 0.1 + (r.t / r.life) * 3.1;
+    if (r.t >= r.life) G.rings.splice(i, 1);
+  }
+
+  /* pops */
+  for (let i = G.pops.length - 1; i >= 0; i--) {
+    const p = G.pops[i]; p.t += dt; p.y += dt * 0.85;
+    if (p.t >= p.life) G.pops.splice(i, 1);
+  }
+
+  /* dust drift */
+  for (const d of G.dust) {
+    d.y -= d.sp * dt * 8;
+    if (d.y < -0.02) { d.y = 1.02; d.x = Math.random(); }
+  }
+}
+
+function decayParticles(dt) {
+  for (let i = G.parts.length - 1; i >= 0; i--) {
+    const p = G.parts[i]; p.t += dt;
+    if (p.t >= p.life) { G.parts.splice(i, 1); continue; }
+    p.vy -= 7.5 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt;
+    if (p.y < 0) { p.y = 0; p.vy *= -0.28; p.vx *= 0.7; p.vz *= 0.7; }
+  }
+}
+
+/* ═══ RENDER ═════════════════════════════════════════════════════════════ */
+function box(x, y, z, w, h, d, colTop, colL, colR, alpha) {
+  // 8 corners -> three visible faces (isometric)
+  const x0 = x, x1 = x + w, y0 = y, y1 = y + h, z0 = z - d / 2, z1 = z + d / 2;
+  const p = (X, Y, Z) => proj(X, Y, Z, G.camY);
+  const A = p(x0, y1, z0), B = p(x1, y1, z0), C = p(x1, y1, z1), D = p(x0, y1, z1); // top
+  const E = p(x0, y0, z1), F = p(x1, y0, z1);                                     // front bottom
+  const Gg = p(x1, y0, z0);                                                       // right bottom
+
+  const prevA = ctx.globalAlpha;
+  if (alpha !== undefined) ctx.globalAlpha = alpha;
+
+  // top face
+  ctx.beginPath(); ctx.moveTo(A.sx, A.sy); ctx.lineTo(B.sx, B.sy);
+  ctx.lineTo(C.sx, C.sy); ctx.lineTo(D.sx, D.sy); ctx.closePath();
+  ctx.fillStyle = colTop; ctx.fill();
+
+  // front face (z1, facing viewer)
+  ctx.beginPath(); ctx.moveTo(D.sx, D.sy); ctx.lineTo(C.sx, C.sy);
+  ctx.lineTo(F.sx, F.sy); ctx.lineTo(E.sx, E.sy); ctx.closePath();
+  ctx.fillStyle = colL; ctx.fill();
+
+  // right face (x1)
+  ctx.beginPath(); ctx.moveTo(C.sx, C.sy); ctx.lineTo(B.sx, B.sy);
+  ctx.lineTo(Gg.sx, Gg.sy); ctx.lineTo(F.sx, F.sy); ctx.closePath();
+  ctx.fillStyle = colR; ctx.fill();
+
+  ctx.globalAlpha = prevA;
+}
+
+function render() {
+  const bio = G.biome;
+  const sx = (Math.random() - 0.5) * G.shake;
+  const sy = (Math.random() - 0.5) * G.shake;
+
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.save();
+  ctx.translate(sx, sy);
+
+  /* sky */
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, bio.sky[0]);
+  grad.addColorStop(0.55, bio.sky[1]);
+  grad.addColorStop(1, bio.sky[2]);
+  ctx.fillStyle = grad;
+  ctx.fillRect(-60, -60, W + 120, H + 120);
+
+  /* dust motes / stars */
+  for (const d of G.dust) {
+    ctx.globalAlpha = d.o * (0.6 + 0.4 * Math.sin(G.t * 1.6 + d.x * 30));
+    ctx.fillStyle = bio.dust;
+    ctx.beginPath();
+    ctx.arc(d.x * W, d.y * H, d.s, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  /* the tower — cull far-below blocks */
+  const lo = Math.max(-1, Math.floor(G.camY) - 2);
+  for (let i = 0; i < G.stack.length; i++) {
+    const s = G.stack[i];
+    if (s.level < lo) continue;
+    const sq = s.sq || 0;
+    const h = CFG.BLOCK_H * (1 - sq * 0.30);
+    const wide = s.w * (1 + sq * 0.16);
+    const cx = s.x - (wide - s.w) / 2;
+    const hue = shade(bio.accent, -Math.min(s.level * 1.4, 46));
+    const edge = Math.abs(s.x - (G.stack[i - 1] ? G.stack[i - 1].x : s.x)) > 0.05;
+    box(cx, s.level, 0, wide, h, CFG.DEPTH,
+        shade(hue, 34), hue, shade(hue, -26));
+    if (edge && s.level >= 0) {           // highlight the seam of a slice
+      const P = proj(s.x + s.w / 2, s.level + h, -CFG.DEPTH / 2, G.camY);
+      ctx.globalAlpha = 0.5;
+      ctx.fillStyle = bio.glow;
+      ctx.fillRect(P.sx - 1, P.sy, 2, 5);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  /* debris */
+  for (const d of G.debris) {
+    ctx.save();
+    const P = proj(d.x + d.w / 2, d.y, 0, G.camY);
+    ctx.translate(P.sx, P.sy);
+    ctx.rotate(d.rot);
+    ctx.globalAlpha = Math.max(0, d.a);
+    const c = shade(bio.accent, -14);
+    ctx.fillStyle = c;
+    const wpx = d.w * ISO_C * SCALE, hpx = CFG.BLOCK_H * SCALE * 0.5;
+    ctx.fillRect(-wpx / 2, -hpx / 2, wpx, hpx);
+    ctx.fillStyle = shade(c, 30);
+    ctx.fillRect(-wpx / 2, -hpx / 2, wpx, hpx * 0.3);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+
+  /* the moving block */
+  if (G.block && G.phase === 'play') {
+    const b = G.block;
+    // motion trail
+    ctx.globalAlpha = 0.18;
+    for (let k = 1; k <= 3; k++) {
+      const tx = b.x - b.dir * 0.11 * k;
+      box(tx, G.level, 0, b.w, CFG.BLOCK_H, CFG.DEPTH,
+          shade(bio.glow, 10), shade(bio.glow, -4), shade(bio.glow, -30));
+    }
+    ctx.globalAlpha = 1;
+    const pulse = 0.5 + 0.5 * Math.sin(G.t * 7);
+    box(b.x, G.level, 0, b.w, CFG.BLOCK_H, CFG.DEPTH,
+        shade(bio.glow, 20 + pulse * 22), bio.glow, shade(bio.glow, -34));
+  }
+
+  /* particles */
+  for (const p of G.parts) {
+    const k = 1 - p.t / p.life;
+    const P = proj(p.x, p.y, p.z, G.camY);
+    ctx.globalAlpha = k;
+    ctx.fillStyle = p.gold ? bio.glow : shade(bio.accent, 60);
+    ctx.beginPath();
+    ctx.arc(P.sx, P.sy, p.size * k * (SCALE / 46), 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  /* shockwave rings */
+  for (const r of G.rings) {
+    const k = 1 - r.t / r.life;
+    const P = proj(r.x, r.y, 0, G.camY);
+    ctx.globalAlpha = k * 0.8;
+    ctx.strokeStyle = bio.glow;
+    ctx.lineWidth = 2 + k * 3;
+    ctx.beginPath();
+    ctx.ellipse(P.sx, P.sy, r.r * SCALE * ISO_C, r.r * SCALE * 0.42, 0, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  /* score pops */
+  ctx.textAlign = 'center';
+  for (const p of G.pops) {
+    const k = 1 - p.t / p.life;
+    const P = proj(p.x, p.y + 0.5, 0, G.camY);
+    ctx.globalAlpha = Math.min(1, k * 1.7);
+    if (p.text) {
+      ctx.fillStyle = `hsl(${p.hue},100%,72%)`;
+      ctx.font = `800 ${Math.round(SCALE * (p.big ? 0.42 : 0.3))}px ui-monospace,monospace`;
+      ctx.fillText(p.text, P.sx, P.sy);
+    }
+    if (p.sub) {
+      ctx.fillStyle = `hsla(${p.hue},90%,82%,0.85)`;
+      ctx.font = `700 ${Math.round(SCALE * 0.3)}px ui-monospace,monospace`;
+      ctx.fillText(p.sub, P.sx, P.sy + SCALE * 0.42);
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  /* glory flash */
+  if (G.flash > 0.01) {
+    ctx.fillStyle = `rgba(255,255,255,${Math.min(0.5, G.flash * 0.55)})`;
+    ctx.fillRect(-60, -60, W + 120, H + 120);
+  }
+
+  drawHUD(bio);
+
+  if (G.phase === 'title') drawTitle(bio);
+  if (G.phase === 'over')  drawOver(bio);
+
+  ctx.restore();
+}
+
+/* ── HUD ───────────────────────────────────────────────────────────────── */
+function drawHUD(bio) {
+  const pad = Math.max(16, W * 0.05);
+  const top = pad + 8;
+
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(255,255,255,0.36)';
+  ctx.font = '700 10px ui-monospace,monospace';
+  ctx.fillText('HEIGHT', pad, top);
+
+  ctx.fillStyle = '#fff';
+  ctx.font = `800 ${Math.round(Math.min(W * 0.155, 58))}px ui-monospace,monospace`;
+  ctx.fillText(String(G.score), pad, top + Math.min(W * 0.135, 50));
+
+  ctx.fillStyle = 'rgba(255,255,255,0.32)';
+  ctx.font = '700 11px ui-monospace,monospace';
+  ctx.fillText('BEST ' + Math.max(G.score, SAVE.best), pad, top + Math.min(W * 0.135, 50) + 20);
+
+  /* right side: biome + streak */
+  ctx.textAlign = 'right';
+  const rp = W - pad;
+  ctx.fillStyle = bio.accent;
+  ctx.font = '800 12px ui-monospace,monospace';
+  ctx.fillText(bio.name, rp, top + 2);
+  ctx.fillStyle = 'rgba(255,255,255,0.28)';
+  ctx.font = '600 9px ui-monospace,monospace';
+  ctx.fillText('BIOME ' + (bio.index + 1), rp, top + 17);
+
+  if (SAVE.streak > 1) {
+    ctx.fillStyle = bio.glow;
+    ctx.font = '800 12px ui-monospace,monospace';
+    ctx.fillText(SAVE.streak + ' DAY STREAK', rp, top + 38);
+  }
+
+  /* progress to next biome */
+  const into = G.level % CFG.BIOME_EVERY;
+  const frac = into / CFG.BIOME_EVERY;
+  const bw = W - pad * 2;
+  ctx.fillStyle = 'rgba(255,255,255,0.09)';
+  ctx.fillRect(pad, H - pad - 6, bw, 3);
+  ctx.fillStyle = bio.accent + 'cc';
+  ctx.fillRect(pad, H - pad - 6, bw * frac, 3);
+
+  /* combo */
+  if (G.combo > 1 && G.phase === 'play') {
+    const a = Math.min(1, G.combo / 9);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = `hsla(44,100%,${62 + a * 14}%,${0.55 + a * 0.45})`;
+    ctx.font = `800 ${Math.round(Math.min(W * 0.062, 25))}px ui-monospace,monospace`;
+    ctx.fillText('COMBO ×' + G.combo, W / 2, H - pad - 26);
+  }
+
+  /* biome banner */
+  if (G.bannerT > 0) {
+    const k = G.bannerT > 2.2 ? (2.6 - G.bannerT) / 0.4 : Math.min(1, G.bannerT / 0.8);
+    ctx.globalAlpha = Math.max(0, Math.min(1, k));
+    ctx.textAlign = 'center';
+    ctx.fillStyle = bio.glow;
+    ctx.font = `900 ${Math.round(Math.min(W * 0.105, 42))}px ui-monospace,monospace`;
+    ctx.fillText(G.bannerName, W / 2, H * 0.32);
+    ctx.fillStyle = bio.accent;
+    ctx.font = '600 12px ui-monospace,monospace';
+    ctx.fillText(G.bannerSub.toUpperCase(), W / 2, H * 0.32 + 24);
+    ctx.globalAlpha = 1;
+  }
+
+  /* new-day celebration */
+  if (G.isNewDay && G.t < 3.4 && G.phase === 'play') {
+    ctx.globalAlpha = Math.max(0, 1 - G.t / 3.4);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = bio.glow;
+    ctx.font = '700 13px ui-monospace,monospace';
+    ctx.fillText('DAY ' + SAVE.streak + ' — WELCOME BACK', W / 2, H * 0.44);
+    ctx.globalAlpha = 1;
+  }
+}
+
+/* ── TITLE ─────────────────────────────────────────────────────────────── */
+function drawTitle(bio) {
+  ctx.fillStyle = 'rgba(4,4,9,0.80)';
+  ctx.fillRect(-60, -60, W + 120, H + 120);
+  ctx.textAlign = 'center';
+
+  const g = ctx.createLinearGradient(0, H * 0.30, 0, H * 0.42);
+  g.addColorStop(0, bio.glow); g.addColorStop(1, bio.accent);
+  ctx.fillStyle = g;
+  ctx.font = `900 ${Math.round(Math.min(W * 0.19, 74))}px ui-monospace,monospace`;
+  ctx.fillText('ZENITH', W / 2, H * 0.40);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.62)';
+  ctx.font = `600 ${Math.round(Math.min(W * 0.036, 14))}px ui-monospace,monospace`;
+  ctx.fillText('every block is a note', W / 2, H * 0.40 + Math.min(W * 0.062, 26));
+  ctx.fillText('every biome is a new key', W / 2, H * 0.40 + Math.min(W * 0.062, 26) + 19);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.40)';
+  ctx.font = '600 11px ui-monospace,monospace';
+  if (SAVE.best > 0) {
+    ctx.fillText('BEST ' + SAVE.best + '   ·   ' + SAVE.stacks + ' BLOCKS LAID', W / 2, H * 0.60);
+  }
+  if (SAVE.streak > 0) {
+    ctx.fillStyle = bio.glow;
+    ctx.fillText(SAVE.streak + ' DAY STREAK', W / 2, H * 0.60 + 20);
+  }
+
+  const p = 0.5 + 0.5 * Math.sin(G.t * 3.2);
+  ctx.fillStyle = `rgba(255,255,255,${0.45 + p * 0.5})`;
+  ctx.font = '800 14px ui-monospace,monospace';
+  ctx.fillText('TAP TO BUILD', W / 2, H * 0.80);
+}
+
+/* ── GAME OVER ─────────────────────────────────────────────────────────── */
+function drawOver(bio) {
+  ctx.fillStyle = 'rgba(4,4,9,0.84)';
+  ctx.fillRect(-60, -60, W + 120, H + 120);
+  ctx.textAlign = 'center';
+
+  const y0 = H * 0.24;
+  ctx.fillStyle = 'rgba(255,255,255,0.34)';
+  ctx.font = '700 11px ui-monospace,monospace';
+  ctx.fillText('THE TOWER FELL', W / 2, y0);
+
+  ctx.fillStyle = '#fff';
+  ctx.font = `900 ${Math.round(Math.min(W * 0.24, 94))}px ui-monospace,monospace`;
+  ctx.fillText(String(G.score), W / 2, y0 + Math.min(W * 0.21, 82));
+
+  if (G.newBest) {
+    const p = 0.6 + 0.4 * Math.sin(G.t * 6);
+    ctx.fillStyle = `rgba(255,222,120,${p})`;
+    ctx.font = '800 14px ui-monospace,monospace';
+    ctx.fillText('★ NEW RECORD ★', W / 2, y0 + Math.min(W * 0.21, 82) + 24);
+  } else {
+    ctx.fillStyle = 'rgba(255,255,255,0.34)';
+    ctx.font = '700 12px ui-monospace,monospace';
+    ctx.fillText('BEST ' + SAVE.best, W / 2, y0 + Math.min(W * 0.21, 82) + 24);
+  }
+
+  /* run stats */
+  const sy = y0 + Math.min(W * 0.21, 82) + 62;
+  const stats = [
+    ['PERFECT', G.perfects],
+    ['BEST COMBO', G.bestComboRun],
+    ['BIOME', bio.name],
+  ];
+  const colW = W / 3;
+  stats.forEach(([label, val], i) => {
+    const cx = colW * i + colW / 2;
+    ctx.fillStyle = 'rgba(255,255,255,0.30)';
+    ctx.font = '700 9px ui-monospace,monospace';
+    ctx.fillText(label, cx, sy);
+    ctx.fillStyle = bio.glow;
+    ctx.font = '800 17px ui-monospace,monospace';
+    ctx.fillText(String(val), cx, sy + 21);
+  });
+
+  if (G.deadFor > 0.45) {
+    const p = 0.5 + 0.5 * Math.sin(G.t * 4.4);
+    ctx.fillStyle = `rgba(255,255,255,${0.42 + p * 0.52})`;
+    ctx.font = '800 14px ui-monospace,monospace';
+    ctx.fillText('TAP TO REBUILD', W / 2, H * 0.83);
+  }
+}
+
+/* ═══ INPUT BINDING ══════════════════════════════════════════════════════ */
+cvs.addEventListener('pointerdown', e => { e.preventDefault(); input(); }, { passive: false });
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space' || e.code === 'Enter' || e.code === 'ArrowUp') {
+    e.preventDefault(); input(); return;
+  }
+  if (e.code === 'KeyM') { Audio.init(); Audio.toggleMute(); }
+}, { passive: false });
+// block iOS double-tap zoom / pull-to-refresh
+document.addEventListener('gesturestart', e => e.preventDefault());
+document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+
+/* ═══ LOOP ═══════════════════════════════════════════════════════════════ */
+let last = performance.now();
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > 0.05) dt = 0.05;          // clamp after tab-switches
+  G.fps = G.fps * 0.9 + (1 / Math.max(dt, 0.001)) * 0.1;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+/* pause when hidden — cheap correctness */
+document.addEventListener('visibilitychange', () => { last = performance.now(); });
+
+/* test/tuning hook — lets the headless harness verify balance and that
+   biome progression, combos and the regrow economy actually fire. */
+if (typeof window !== 'undefined') {
+  window.__ZENITH__ = { G, CFG, SAVE, biomeAt };
+}
+
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Rift — core loop prototype</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%;overflow:hidden;background:#07070c;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#e8e8f0}
+  canvas{display:block;width:100%;height:100%;touch-action:none;cursor:pointer}
+  #hint{position:fixed;left:0;right:0;bottom:22px;text-align:center;font-size:12px;letter-spacing:.14em;
+        color:#454560;text-transform:uppercase;pointer-events:none;transition:opacity .4s}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">tap or press space</div>
+<script>
+(() => {
+'use strict';
+
+/* ═══════════════════════════════════════════════════════════════════════
+   RIFT — a one-button timing game.
+   Prototype demonstrating the core-loop principles in
+   RESEARCH-addictive-design.md §2 (variable reward), §6 (core loop),
+   and the "juice" requirements of §11 Phase 1.
+
+   The loop: a marker sweeps a bar. Stop it in the zone. Zone shrinks,
+   marker speeds up. 3 misses end the run. Score escalates with combo.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+const cvs = document.getElementById('c');
+const ctx = cvs.getContext('2d');
+const hint = document.getElementById('hint');
+
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  cvs.width = W * DPR; cvs.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener('resize', resize); resize();
+
+/* ─────────────── state ─────────────── */
+const S = {
+  phase: 'idle',          // idle | playing | gameover
+  marker: 0,              // -1 .. 1 across the bar
+  dir: 1,
+  speed: 0.85,            // units per second (half-bar units)
+  zone: 0.30,             // half-width of target zone
+  hits: 0, misses: 0, score: 0, combo: 0, best: 0,
+  shake: 0, flash: 0, t: 0,
+  msgs: [], particles: [], floaters: [],
+  lastResult: '',
+};
+
+try { S.best = parseInt(localStorage.getItem('rift.best') || '0', 10) || 0; } catch (e) {}
+
+const MAX_MISSES = 3;
+
+/* ─────────────── juice: particles + floating score ─────────────── */
+function burst(x, y, n, hue, power) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const v = (0.4 + Math.random() * 1.4) * power;
+    S.particles.push({
+      x, y, vx: Math.cos(a) * v * 380, vy: Math.sin(a) * v * 380 - 90,
+      life: 0.55 + Math.random() * 0.5, age: 0, hue, r: 1.4 + Math.random() * 2.6,
+    });
+  }
+}
+function float(x, y, text, hue, size) {
+  S.floaters.push({ x, y, text, hue, size: size || 26, age: 0, life: 0.95, vy: -78 });
+}
+
+/* ─────────────── audio: engine pitched to combo ─────────────── */
+let AC = null;
+function blip(freq, dur, type, gain) {
+  if (!AC) return;
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type || 'triangle';
+  o.frequency.setValueAtTime(freq, AC.currentTime);
+  o.frequency.exponentialRampToValueAtTime(freq * 1.6, AC.currentTime + dur);
+  g.gain.setValueAtTime(gain || 0.12, AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + dur);
+  o.connect(g); g.connect(AC.destination);
+  o.start(); o.stop(AC.currentTime + dur + 0.02);
+}
+function initAudio() {
+  if (AC) return;
+  try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+}
+
+/* ─────────────── geometry ─────────────── */
+function barGeom() {
+  const pad = Math.max(26, W * 0.09);
+  const y = H * 0.56;
+  return { x0: pad, x1: W - pad, y, w: W - pad * 2 };
+}
+
+/* ─────────────── the one input ─────────────── */
+function fire() {
+  initAudio();
+  if (S.phase === 'idle') { startRun(); return; }
+  if (S.phase === 'gameover') {
+    if (S.deadFor > 0.45) startRun();
+    return;
+  }
+
+  const { x0, y, w } = barGeom();
+  const mpx = x0 + ((S.marker + 1) / 2) * w;
+  const d = Math.abs(S.marker - S.zoneCenterAtZero());
+  // zone is centred at marker 0
+  const dist = Math.abs(S.marker);
+
+  let result, pts = 0, hue = 200;
+
+  if (dist <= S.zone * 0.22) {
+    result = 'perfect'; hue = 150;
+    S.combo++; S.hits++;
+    pts = Math.round(10 * Math.min(1 + S.combo * 0.35, 8) * 3);
+    S.shake = 13; S.flash = 0.34;
+    burst(mpx, y, 34, 150, 1.5);
+    float(mpx, y - 52, 'PERFECT', 150, 30);
+    float(mpx, y - 92, '+' + pts, 150, 22);
+    blip(620 + Math.min(S.combo, 18) * 46, 0.11, 'triangle', 0.15);
+  } else if (dist <= S.zone) {
+    result = 'good'; hue = 48;
+    S.combo++; S.hits++;
+    pts = Math.round(10 * Math.min(1 + S.combo * 0.35, 8));
+    S.shake = 5; S.flash = 0.14;
+    burst(mpx, y, 14, 48, 0.85);
+    float(mpx, y - 52, 'GOOD', 48, 24);
+    float(mpx, y - 88, '+' + pts, 48, 19);
+    blip(400 + Math.min(S.combo, 18) * 28, 0.09, 'square', 0.09);
+  } else if (dist <= S.zone * 1.75) {
+    // near miss — feedback without reward. Compulsion-loop exit must stay visible.
+    result = 'near'; hue = 18;
+    S.misses++; S.combo = 0;
+    S.shake = 9;
+    burst(mpx, y, 10, 18, 0.75);
+    float(mpx, y - 52, 'SO CLOSE', 18, 23);
+    blip(150, 0.2, 'sawtooth', 0.11);
+  } else {
+    result = 'miss'; hue = 350;
+    S.misses++; S.combo = 0;
+    S.shake = 7;
+    float(mpx, y - 52, 'MISS', 350, 23);
+    blip(96, 0.26, 'sawtooth', 0.1);
+  }
+
+  S.score += pts;
+  S.lastResult = result;
+
+  if (S.misses >= MAX_MISSES) { endRun(); return; }
+
+  // difficulty ramps — keeps reward uncertainty alive as skill grows (§2.3)
+  S.zone = Math.max(0.055, S.zone * (result === 'miss' ? 1.0 : 0.925));
+  S.speed *= 1.045;
+  S.lastResult = result;
+}
+
+// marker 0 == centre of zone
+S.zoneCenterAtZero = () => 0;
+
+function startRun() {
+  S.phase = 'playing';
+  S.marker = -0.92; S.dir = 1; S.speed = 0.85; S.zone = 0.30;
+  S.hits = 0; S.misses = 0; S.score = 0; S.combo = 0;
+  S.particles.length = 0; S.floaters.length = 0;
+  S.shake = 0; S.flash = 0;
+  hint.style.opacity = '0';
+}
+
+function endRun() {
+  S.phase = 'gameover';
+  S.deadFor = 0;
+  S.shake = 22; S.flash = 0.5;
+  if (S.score > S.best) {
+    S.best = S.score;
+    try { localStorage.setItem('rift.best', String(S.best)); } catch (e) {}
+  }
+  blip(80, 0.5, 'sawtooth', 0.14);
+}
+
+/* ─────────────── input binding ─────────────── */
+cvs.addEventListener('pointerdown', e => { e.preventDefault(); fire(); });
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); fire(); }
+});
+
+/* ─────────────── update ─────────────── */
+function update(dt) {
+  S.t += dt;
+  S.shake *= Math.pow(0.0016, dt);
+  S.flash *= Math.pow(0.0009, dt);
+
+  if (S.phase === 'playing') {
+    S.marker += S.dir * S.speed * dt;
+    if (S.marker > 1)  { S.marker = 1;  S.dir = -1; }
+    if (S.marker < -1) { S.marker = -1; S.dir = 1; }
+  }
+  if (S.phase === 'gameover') S.deadFor = (S.deadFor || 0) + dt;
+
+  for (let i = S.particles.length - 1; i >= 0; i--) {
+    const p = S.particles[i];
+    p.age += dt;
+    if (p.age >= p.life) { S.particles.splice(i, 1); continue; }
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 900 * dt; p.vx *= 0.985;
+  }
+  for (let i = S.floaters.length - 1; i >= 0; i--) {
+    const f = S.floaters[i];
+    f.age += dt;
+    if (f.age >= f.life) { S.floaters.splice(i, 1); continue; }
+    f.y += f.vy * dt; f.vy *= 0.94;
+  }
+}
+
+/* ─────────────── render ─────────────── */
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function draw() {
+  const { x0, x1, y, w } = barGeom();
+  const cx = x0 + ((S.marker + 1) / 2) * w;
+
+  ctx.save();
+  const sx = (Math.random() - 0.5) * S.shake;
+  const sy = (Math.random() - 0.5) * S.shake;
+  ctx.translate(sx, sy);
+
+  // backdrop
+  const bg = ctx.createRadialGradient(W / 2, y, 0, W / 2, y, Math.max(W, H) * 0.9);
+  bg.addColorStop(0, '#12121f'); bg.addColorStop(1, '#07070c');
+  ctx.fillStyle = bg; ctx.fillRect(-40, -40, W + 80, H + 80);
+
+  // header
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#3a3a58';
+  ctx.font = '600 11px ui-monospace,monospace';
+  ctx.fillText('RIFT', W / 2, 40);
+
+  ctx.fillStyle = '#e8e8f0';
+  ctx.font = '700 54px ui-monospace,monospace';
+  ctx.fillText(String(S.score), W / 2, 100);
+
+  // combo
+  if (S.combo > 1 && S.phase === 'playing') {
+    const a = Math.min(1, S.combo / 12);
+    ctx.fillStyle = `hsla(${150 + a * 90},90%,62%,${0.5 + a * 0.5})`;
+    ctx.font = '700 17px ui-monospace,monospace';
+    ctx.fillText('COMBO ×' + S.combo, W / 2, 130);
+  }
+  ctx.fillStyle = '#30304a';
+  ctx.font = '600 11px ui-monospace,monospace';
+  ctx.fillText('BEST ' + S.best, W / 2, 152);
+
+  // misses (lives)
+  for (let i = 0; i < MAX_MISSES; i++) {
+    const bx = W / 2 - (MAX_MISSES - 1) * 11 + i * 22;
+    ctx.beginPath();
+    ctx.arc(bx, 178, 5.5, 0, Math.PI * 2);
+    ctx.fillStyle = i < MAX_MISSES - S.misses ? '#3ddc97' : '#2a2a40';
+    ctx.fill();
+  }
+
+  // track
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = '#191926';
+  ctx.lineWidth = 30;
+  ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
+
+  // target zone
+  const zonePx = S.zone * (w / 2);
+  const g = ctx.createLinearGradient(0, y - 16, 0, y + 16);
+  g.addColorStop(0, 'rgba(61,220,151,0.42)');
+  g.addColorStop(1, 'rgba(61,220,151,0.12)');
+  ctx.fillStyle = g;
+  roundRect(W / 2 - zonePx, y - 15, zonePx * 2, 30, 6); ctx.fill();
+
+  // perfect core
+  const corePx = zonePx * 0.22;
+  ctx.fillStyle = 'rgba(61,220,151,0.85)';
+  roundRect(W / 2 - Math.max(corePx, 1.6), y - 15, Math.max(corePx * 2, 3.2), 30, 2); ctx.fill();
+
+  // marker
+  ctx.shadowBlur = 22; ctx.shadowColor = '#7aa2ff';
+  ctx.fillStyle = '#dce6ff';
+  roundRect(cx - 3.5, y - 30, 7, 60, 4); ctx.fill();
+  ctx.shadowBlur = 0;
+
+  // particles
+  for (const p of S.particles) {
+    const k = 1 - p.age / p.life;
+    ctx.globalAlpha = k;
+    ctx.fillStyle = `hsl(${p.hue},92%,${55 + k * 20}%)`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r * k, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // floating text
+  ctx.textAlign = 'center';
+  for (const f of S.floaters) {
+    const k = 1 - f.age / f.life;
+    ctx.globalAlpha = Math.min(1, k * 1.8);
+    ctx.fillStyle = `hsl(${f.hue},95%,68%)`;
+    ctx.font = `800 ${f.size}px ui-monospace,monospace`;
+    ctx.fillText(f.text, f.x, f.y);
+  }
+  ctx.globalAlpha = 1;
+
+  // flash
+  if (S.flash > 0.01) {
+    ctx.fillStyle = `rgba(180,255,220,${S.flash * 0.5})`;
+    ctx.fillRect(-40, -40, W + 80, H + 80);
+  }
+
+  // screens
+  if (S.phase === 'idle') {
+    ctx.fillStyle = 'rgba(7,7,12,0.82)';
+    ctx.fillRect(-40, -40, W + 80, H + 80);
+    ctx.fillStyle = '#e8e8f0';
+    ctx.font = '800 40px ui-monospace,monospace';
+    ctx.fillText('RIFT', W / 2, H / 2 - 40);
+    ctx.fillStyle = '#7aa2ff';
+    ctx.font = '600 15px ui-monospace,monospace';
+    ctx.fillText('stop the bar in the zone', W / 2, H / 2 + 2);
+    ctx.fillStyle = '#454560';
+    ctx.font = '600 12px ui-monospace,monospace';
+    ctx.fillText('3 misses and the run ends', W / 2, H / 2 + 30);
+  }
+
+  if (S.phase === 'gameover') {
+    ctx.fillStyle = 'rgba(7,7,12,0.86)';
+    ctx.fillRect(-40, -40, W + 80, H + 80);
+    ctx.fillStyle = '#e8e8f0';
+    ctx.font = '800 26px ui-monospace,monospace';
+    ctx.fillText('RUN OVER', W / 2, H / 2 - 74);
+    ctx.font = '800 76px ui-monospace,monospace';
+    ctx.fillStyle = '#3ddc97';
+    ctx.fillText(String(S.score), W / 2, H / 2 + 6);
+    ctx.font = '600 13px ui-monospace,monospace';
+    ctx.fillStyle = '#8a8aa8';
+    ctx.fillText(`${S.hits} hits  ·  best ${S.best}`, W / 2, H / 2 + 34);
+    if (S.deadFor > 0.45) {
+      const pulse = 0.55 + 0.45 * Math.sin(S.t * 5);
+      ctx.fillStyle = `rgba(122,162,255,${pulse})`;
+      ctx.font = '700 15px ui-monospace,monospace';
+      ctx.fillText('tap to go again', W / 2, H / 2 + 78);
+    }
+  }
+
+  ctx.restore();
+}
+
+/* ─────────────── loop ─────────────── */
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+# deps / build
+node_modules/
+dist/
+build/
+out/
+target/
+.gradle/
+*.apk
+*.aab
+*.keystore
+*.jks
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+
+# os / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+.env
+.env.local

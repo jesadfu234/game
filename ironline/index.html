@@ -1,0 +1,1797 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#08080d">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>IRONLINE</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;
+    -webkit-user-select:none;user-select:none}
+  html,body{width:100%;height:100%;overflow:hidden;background:#08080d;
+    font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;color:#eef1f6;
+    overscroll-behavior:none;touch-action:none}
+  canvas{display:block;width:100%;height:100%;touch-action:none;cursor:pointer}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* ═══════════════════════════════════════════════════════════════════════════
+   IRONLINE
+   Real-time lane war. Deploy units from a cycling hand, manage a regenerating
+   resource, break hard counters, and push a battle line into the enemy core.
+
+   Design sources — see RESEARCH-addictive-design.md and GAME-DESIGN.md
+     §2.3  reward variability + rising difficulty hold compulsion over time
+     §2.4  compulsion loop: degrade efficiency, show an EARNED path back
+     §6    three nested loops: core (seconds) / progression (run) / meta (days)
+     CHI'24 (n=1699): curiosity + graded success drive enjoyment, not juice
+     Flow (Thumper, n=100): challenge tracking skill produces time distortion
+   ═══════════════════════════════════════════════════════════════════════════ */
+(() => {
+'use strict';
+
+const REDUCED = typeof window !== 'undefined' && window.matchMedia &&
+  window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const MOTION = REDUCED ? 0.3 : 1;
+
+/* ═══ WORLD ═══════════════════════════════════════════════════════════════ */
+const WORLD = {
+  W: 1200,            // battlefield width in world units
+  GROUND: 0,          // ground line (units stand on it)
+  LANE: 26,           // maximum vertical scatter, ±
+  P_BASE_X: 46, E_BASE_X: 1092, BASE_W: 62,
+  P_DEPLOY: [118, 596], E_DEPLOY: [604, 1082],
+  P_SPAWN: 128, E_SPAWN: 1072,
+};
+
+const CFG = {
+  ELIXIR_MAX: 10, ELIXIR_START: 5,
+  ELIXIR_RATE: 1 / 2.7,        // units per second
+  DOUBLE_TIME: 60,             // seconds remaining when elixir doubles (per side separately)
+  BATTLE_TIME: 165,            // long enough for a comeback, short enough to retry
+  BASE_HP: 2000,
+  /* Units hit structures harder than they hit each other. Without this the
+     defender's spawn advantage makes every match a chip-damage stalemate
+     that limps to the timer instead of ending in a break. */
+  CORE_DMG_MULT: 2.1,
+  HAND_SIZE: 4, DECK_SIZE: 8,
+  MAX_UNIT_LEVEL: 5,
+  UPGRADE_COST: [0, 120, 260, 520, 950],   // cost to reach level index+1
+  UPGRADE_GAIN: 0.13,          // +13% hp/dmg per level
+};
+
+/* ═══ UNIT TABLE ══════════════════════════════════════════════════════════
+   Every unit has a job. The counters are deliberate and readable:
+     swarm  > single-target high-damage  (Marksman)
+     splash > swarm                      (Grenadier, Mortar)
+     tank   > swarm / rush               (Bulwark)
+     range  > tank                       (Marksman, Mortar)
+     rush   > artillery (min range!)     (Runner)
+   ═════════════════════════════════════════════════════════════════════════ */
+const U = {
+  runner: { name:'Runner',   cost:1, hp:115,  dmg:17,  rate:0.65, range:26,  minR:0,
+            speed:108, r:9,  kind:'melee',  splash:0,  col:'#6ff0c0', shape:'runner',
+            blurb:'Cheapest body. Fast. Melts to anything splashing.' },
+  rifle:  { name:'Rifleman', cost:2, hp:215,  dmg:23,  rate:0.82, range:118, minR:0,
+            speed:52,  r:10, kind:'ranged', splash:0,  col:'#8fb8ff', shape:'rifle',
+            blurb:'Reliable line infantry. Good dps for the price.' },
+  shield: { name:'Bulwark',  cost:3, hp:640,  dmg:27,  rate:1.05, range:26,  minR:0,
+            speed:34,  r:14, kind:'melee',  splash:0,  col:'#cdd4e0', shape:'shield',
+            blurb:'Absorbs everything. Kill it with range, not with bodies.' },
+  swarm:  { name:'Drones',   cost:3, hp:72,   dmg:13,  rate:0.48, range:22,  minR:0,
+            speed:92,  r:7,  kind:'melee',  splash:0,  col:'#ffe27a', shape:'drone',
+            count:3, blurb:'Three bodies. Suffocates single-target shooters.' },
+  gren:   { name:'Grenadier',cost:3, hp:195,  dmg:36,  rate:1.25, range:80,  minR:0,
+            speed:48,  r:11, kind:'splash', splash:52, col:'#ff9a5c', shape:'gren',
+            blurb:'Arcing splash. Deletes swarms and clustered pushes.' },
+  sniper: { name:'Marksman', cost:4, hp:155,  dmg:96,  rate:1.85, range:238, minR:0,
+            speed:40,  r:10, kind:'ranged', splash:0,  col:'#ff7bd0', shape:'sniper',
+            blurb:'Outranges everything. Fragile. No answer to a rush.' },
+  medic:  { name:'Medic',    cost:3, hp:175,  dmg:0,   rate:1.0,  range:96,  minR:0,
+            speed:56,  r:10, kind:'heal',   splash:0,  col:'#9dffb0', shape:'medic',
+            heal:36, blurb:'Sustains a push. Useless alone.' },
+  mech:   { name:'Juggernaut',cost:6,hp:1300, dmg:80,  rate:1.15, range:32,  minR:0,
+            speed:26,  r:19, kind:'melee',  splash:0,  col:'#ff5f5f', shape:'mech',
+            blurb:'Endgame wall. Slow enough to be kited forever.' },
+  mortar: { name:'Mortar',   cost:5, hp:245,  dmg:128, rate:2.3,  range:340, minR:104,
+            speed:19,  r:14, kind:'splash', splash:66, col:'#b58cff', shape:'mortar',
+            blurb:'Huge range, huge splash — but a MINIMUM range. Rush it.' },
+  strike: { name:'Airstrike',cost:4, hp:0,    dmg:180, rate:0,    range:0,   minR:0,
+            speed:0,   r:0,  kind:'spell',  splash:86, col:'#ffc63d', shape:'spell',
+            blurb:'Called anywhere on the field. Big splash, no body.' },
+};
+const ALL_UNITS = Object.keys(U);
+
+/* ═══ THEMES (per mission) ═══════════════════════════════════════════════ */
+const THEMES = {
+  dawn:   { sky:['#2a1a35','#5c3355','#a85c5c'], far:'#3a2440', mid:'#2a1a2e',
+            ground:'#181020', gline:'#241a30', fog:'rgba(255,160,120,0.06)', weather:null,  accent:'#ffb27a' },
+  day:    { sky:['#1d2b4a','#33507e','#6f93c4'], far:'#243450', mid:'#1b2740',
+            ground:'#141c2c', gline:'#1e2a40', fog:'rgba(180,220,255,0.05)', weather:null,  accent:'#8fc4ff' },
+  storm:  { sky:['#0d0f18','#1e2436','#3c4860'], far:'#161c2c', mid:'#101624',
+            ground:'#0b0e16', gline:'#141a28', fog:'rgba(150,170,210,0.07)', weather:'rain', accent:'#a8c0e8' },
+  dusk:   { sky:['#1a1030','#4a1f52','#a03a5c'], far:'#2a1840', mid:'#1e1230',
+            ground:'#120b1c', gline:'#1c1228', fog:'rgba(255,120,180,0.07)', weather:null,  accent:'#ff86c0' },
+  night:  { sky:['#05060f','#0e1226','#1e2a4e'], far:'#0d1020', mid:'#080b16',
+            ground:'#05070e', gline:'#0d1220', fog:'rgba(120,150,255,0.06)', weather:'snow', accent:'#9fb6ff' },
+  ash:    { sky:['#160a0a','#3a1414','#722020'], far:'#240e0e', mid:'#180808',
+            ground:'#0e0606', gline:'#1a0a0a', fog:'rgba(255,90,60,0.09)',  weather:'ash',  accent:'#ff7050' },
+  gold:   { sky:['#241a06','#5c3f10','#a8801f'], far:'#3a2a0c', mid:'#261906',
+            ground:'#140f04', gline:'#241a08', fog:'rgba(255,220,120,0.08)', weather:null,  accent:'#ffd97a' },
+};
+
+/* ═══ CAMPAIGN ═══════════════════════════════════════════════════════════
+   Twelve missions. Each is a distinct opponent with its own deck bias,
+   difficulty profile, and battlefield mood. Rewards unlock the roster. */
+const CAMPAIGN = [
+  { id:0,  name:'FIRST CONTACT', foe:'Scout Cohort',  theme:'dawn',  baseHp:1480,
+    deck:['runner','rifle'], ai:{ react:1.5, rand:0.9, patience:0.35, greed:0.5 },
+    reward:110, unlock:null, brief:'A probing force. They will come at you in ones and twos.' },
+  { id:1,  name:'THE LINE',      foe:'Border Legion',  theme:'day',   baseHp:1880,
+    deck:['rifle','shield','runner'], ai:{ react:1.3, rand:0.8, patience:0.4, greed:0.55 },
+    reward:140, unlock:'shield', brief:'They hold ground. You will need something that hits harder.' },
+  { id:2,  name:'SWARM DOCTRINE',foe:'Hive Wing',     theme:'storm', baseHp:1930,
+    deck:['swarm','runner','rifle'], ai:{ react:1.1, rand:0.7, patience:0.3, greed:0.7 },
+    reward:170, unlock:'gren', brief:'Numbers. Bring something that splashes.' },
+  { id:3,  name:'LONG SIGHT',    foe:'Ridge Marksmen', theme:'dusk',  baseHp:2090,
+    deck:['sniper','rifle','runner'], ai:{ react:1.18, rand:0.62, patience:0.5, greed:0.6 },
+    reward:200, unlock:'sniper', brief:'They see you before you see them. Break their line fast.' },
+  { id:4,  name:'SIEGE PATTERN', foe:'Iron Battery',  theme:'ash',   baseHp:2140,
+    deck:['mortar','shield','gren'], ai:{ react:1.02, rand:0.55, patience:0.5, greed:0.65 },
+    reward:240, unlock:'mortar', brief:'Artillery behind walls. Get underneath the guns.' },
+  { id:5,  name:'FIELD HOSPITAL',foe:'Sustain Corps', theme:'day',   baseHp:2240,
+    deck:['medic','shield','rifle','sniper'], ai:{ react:0.98, rand:0.5, patience:0.45, greed:0.6 },
+    reward:270, unlock:'medic', brief:'They will not die. Kill the healers or out-damage them.' },
+  { id:6,  name:'THE ANVIL',     foe:'Siege Marshal', theme:'storm', baseHp:2300,
+    deck:['mech','mortar','shield','gren'], ai:{ react:0.92, rand:0.45, patience:0.5, greed:0.6 },
+    reward:310, unlock:'mech', brief:'A Juggernaut leads. It will not stop. Make it stop.' },
+  { id:7,  name:'BLACK SKY',     foe:'Air Command',   theme:'night', baseHp:2560,
+    deck:['strike','swarm','sniper','runner'], ai:{ react:0.70, rand:0.3, patience:0.35, greed:0.8 },
+    reward:340, unlock:'strike', brief:'They bomb the line before they push it.' },
+  { id:8,  name:'COLD EQUATION', foe:'The Calculator',theme:'night', baseHp:2500,
+    deck:['sniper','gren','shield','mortar','runner'], ai:{ react:0.76, rand:0.3, patience:0.55, greed:0.72 },
+    reward:400, unlock:null, brief:'Perfect counters. Perfect elixir. You cannot out-think it — outplay it.' },
+  { id:9,  name:'OVERWHELM',     foe:'Red Tide',      theme:'ash',   baseHp:2680,
+    deck:['swarm','runner','gren','mech','medic'], ai:{ react:0.76, rand:0.3, patience:0.3, greed:0.9 },
+    reward:450, unlock:'runner', brief:'They will not stop coming. Neither should you.' },
+  { id:10, name:'THE GAUNTLET',  foe:'War Assembly',  theme:'dusk',  baseHp:2880,
+    deck:['mech','mortar','sniper','gren','medic','shield'], ai:{ react:0.70, rand:0.22, patience:0.55, greed:0.78 },
+    reward:520, unlock:null, brief:'Everything you have learned, thrown back at once.' },
+  { id:11, name:'IRONLINE',      foe:'General Vess',  theme:'gold',  baseHp:3180,
+    deck:['mech','sniper','mortar','gren','medic','shield','strike','swarm'],
+    ai:{ react:0.62, rand:0.12, patience:0.6, greed:0.82 },
+    reward:700, unlock:null, brief:'The last line. Break it and the war is over.' },
+];
+
+/* ═══ SAVE ═══════════════════════════════════════════════════════════════ */
+const SAVE = {
+  gold: 0, cleared: 0, levels: {}, deck: ['runner','rifle','swarm','gren'],
+  owned: ['runner','rifle','shield','swarm','gren'],
+  wins: 0, losses: 0, totalUnits: 0, totalDamage: 0,
+  lastDay: '', streak: 0, missionStars: {},
+  load() {
+    try { const r = localStorage.getItem('ironline.v1'); if (r) Object.assign(this, JSON.parse(r)); }
+    catch (e) {}
+  },
+  save() {
+    try {
+      localStorage.setItem('ironline.v1', JSON.stringify({
+        gold:this.gold, cleared:this.cleared, levels:this.levels, deck:this.deck,
+        owned:this.owned, wins:this.wins, losses:this.losses,
+        totalUnits:this.totalUnits, totalDamage:this.totalDamage,
+        lastDay:this.lastDay, streak:this.streak, missionStars:this.missionStars,
+      }));
+    } catch (e) {}
+  },
+  lvl(u) { return this.levels[u] || 1; },
+  registerDay() {
+    const d = new Date(), today = d.toDateString();
+    if (this.lastDay === today) return false;
+    const y = new Date(d.getTime() - 864e5).toDateString();
+    this.streak = (this.lastDay === y) ? this.streak + 1 : 1;
+    this.lastDay = today; this.save(); return true;
+  },
+  /* Build a deck with real role coverage rather than the 8 cheapest cards:
+     a cheap cycle card, a body-blocker, ranged damage, splash, and a finisher.
+     Guarantees the hand can always answer something. */
+  autoDeck() {
+    const has = k => this.owned.includes(k) && !pick.includes(k);
+    const pick = [];
+    const first = (keys) => { for (const k of keys) if (has(k)) { pick.push(k); return true; } return false; };
+    first(['runner','rifle']);                                  // cheap cycle
+    first(['shield','mech']);                                   // something to hide behind
+    first(['sniper','mortar']);                                 // ANTI-TANK ranged answer
+    first(['rifle','gren','swarm']);                            // cheap ranged/cycle
+    first(['gren','mortar','strike']);                          // splash
+    first(['medic','sniper','mech']);                           // finisher / sustain
+    /* Fill the rest by value-per-elixir, but penalise a top-heavy curve.
+       A deck whose average cost drifts past ~3.7 cannot cycle and loses to
+       any fast deck, regardless of how strong the individual cards are. */
+    const rest = this.owned.filter(k => !pick.includes(k));
+    while (pick.length < CFG.DECK_SIZE && pick.length < this.owned.length) {
+      let bestK = null, bestS = -1e9;
+      for (const k of rest) {
+        if (pick.includes(k)) continue;
+        const d = U[k];
+        const avg = (pick.reduce((a,x)=>a+U[x].cost,0) + d.cost) / (pick.length+1);
+        let s2 = (d.hp + (d.dmg||0)*6 + (d.heal||0)*6) / d.cost;
+        if (avg > 3.7) s2 -= (avg - 3.7) * 260;
+        if (s2 > bestS) { bestS = s2; bestK = k; }
+      }
+      if (!bestK) break;
+      pick.push(bestK);
+    }
+    this.deck = pick.slice(0, CFG.DECK_SIZE);
+    while (this.deck.length < CFG.DECK_SIZE && this.owned.length)
+      this.deck.push(this.owned[this.deck.length % this.owned.length]);
+    this.save();
+  },
+};
+SAVE.load();
+
+/* ═══ AUDIO — fully procedural, zero assets ═════════════════════════════ */
+const Snd = (() => {
+  let ac = null, master = null, ready = false, muted = false, bus = null;
+  function init() {
+    if (ready) return;
+    const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+    try { ac = new AC(); } catch (e) { return; }
+    master = ac.createGain(); master.gain.value = 0.8; master.connect(ac.destination);
+    // shared reverb-ish delay
+    const d = ac.createDelay(0.6); d.delayTime.value = 0.12;
+    const fb = ac.createGain(); fb.gain.value = 0.22;
+    const lp = ac.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=2600;
+    bus = ac.createGain(); bus.gain.value = 0.3;
+    d.connect(lp); lp.connect(fb); fb.connect(d); d.connect(bus); bus.connect(master);
+    ready = true;
+  }
+  const P = (v) => ({ value:v, setValueAtTime(){}, linearRampToValueAtTime(){}, exponentialRampToValueAtTime(){}, cancelScheduledValues(){} });
+  function tone(f, dur, type, gain, slideTo, when) {
+    if (!ready || muted) return;
+    const t = when || ac.currentTime;
+    const o = ac.createOscillator(), g = ac.createGain(), fl = ac.createBiquadFilter();
+    o.type = type || 'square'; o.frequency.setValueAtTime(f, t);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+    fl.type = 'lowpass'; fl.frequency.value = Math.min(f * 6 + 800, 8000);
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(gain, t + 0.006);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(fl); fl.connect(g); g.connect(master); g.connect(bus);
+    o.start(t); o.stop(t + dur + 0.02);
+  }
+  function noise(dur, gain, cutoff, q, when) {
+    if (!ready || muted) return;
+    const t = when || ac.currentTime;
+    const n = Math.max(1, Math.floor(ac.sampleRate * dur));
+    const buf = ac.createBuffer(1, n, ac.sampleRate), d = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = (Math.random()*2-1) * Math.pow(1 - i/n, 2.4);
+    const s = ac.createBufferSource(); s.buffer = buf;
+    const f = ac.createBiquadFilter(); f.type='lowpass'; f.frequency.value = cutoff || 900; if (q) f.Q.value = q;
+    const g = ac.createGain(); g.gain.value = gain;
+    s.connect(f); f.connect(g); g.connect(master); g.connect(bus); s.start(t);
+  }
+  const lastAt = {};
+  function gate(k, ms) { const n = performance.now(); if (lastAt[k] && n - lastAt[k] < ms) return false; lastAt[k] = n; return true; }
+
+  return {
+    init,
+    get muted(){ return muted; },
+    toggle() { muted = !muted; if (master) master.gain.value = muted?0:0.8; return muted; },
+    resume() { if (ac && ac.state === 'suspended') ac.resume(); },
+
+    shot()      { if (gate('shot', 45))  { noise(0.05, 0.07, 2600); tone(340, 0.05, 'square', 0.03, 180); } },
+    heavy()     { if (gate('heavy', 90)) { noise(0.13, 0.16, 900);  tone(110, 0.11, 'sawtooth', 0.06, 60); } },
+    thump()     { if (gate('thump', 70)) { noise(0.18, 0.2, 300, 1.2); tone(72, 0.16, 'sine', 0.10, 44); } },
+    boom()      { noise(0.5, 0.4, 260, 0.9); tone(58, 0.45, 'sawtooth', 0.16, 30); },
+    deploy()    { if (gate('dep', 60))  { tone(300, 0.1, 'triangle', 0.07, 620); } },
+    err()       { tone(150, 0.13, 'sawtooth', 0.07, 96); },
+    select()    { tone(720, 0.05, 'sine', 0.05); },
+    crack()     { noise(1.1, 0.5, 190, 0.7); tone(90, 0.9, 'sawtooth', 0.2, 34); },
+    win()  { [0,4,7,12,16].forEach((s,i)=>tone(261.63*Math.pow(2,s/12), 0.62, 'triangle', 0.11, null, ac?ac.currentTime+i*0.1:0)); },
+    lose() { [0,-3,-7,-10].forEach((s,i)=>tone(220*Math.pow(2,s/12), 0.7, 'sine', 0.11, null, ac?ac.currentTime+i*0.13:0)); },
+    tick() { tone(1100, 0.05, 'sine', 0.05); },
+  };
+})();
+
+/* ═══ CANVAS + LAYOUT ════════════════════════════════════════════════════ */
+const cvs = document.getElementById('c');
+const ctx = cvs.getContext('2d');
+let W=0, H=0, DPR=1;
+const LAY = { field:null, scale:1, unitY:0, cards:[], cardH:0, cardY:0, elixirY:0 };
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = Math.max(window.innerWidth, 320); H = Math.max(window.innerHeight, 400);
+  cvs.width = Math.floor(W*DPR); cvs.height = Math.floor(H*DPR);
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+
+  const topPad = Math.max(52, H*0.085);
+  const cardBarH = Math.max(116, Math.min(H*0.26, 168));
+  const fieldH = H - topPad - cardBarH - 10;
+  const s = Math.min(W / WORLD.W, fieldH / 420);
+  const fw = WORLD.W * s, fh = 420 * s;
+  const fx = (W - fw) / 2, fy = topPad + (fieldH - fh) / 2;
+  LAY.scale = s; LAY.field = { x:fx, y:fy, w:fw, h:fh };
+  LAY.unitY = fy + fh * 0.70;                       // where the ground line sits
+  LAY.cardH = cardBarH - 34;
+  LAY.cardY = H - cardBarH + 22;
+  LAY.elixirY = H - 22;
+
+  const cn = CFG.HAND_SIZE, gap = Math.max(6, W*0.016);
+  const cw = Math.min((W - gap*(cn+1)) / cn, 150);
+  const total = cw*cn + gap*(cn-1);
+  const sx = (W - total) / 2;
+  LAY.cards = [];
+  for (let i=0;i<cn;i++) LAY.cards.push({ x: sx + i*(cw+gap), y: LAY.cardY, w: cw, h: LAY.cardH });
+}
+window.addEventListener('resize', resize, { passive:true });
+resize();                       // must run once at boot, not only on later resizes
+
+function w2s(x, yOff) {   // world x + lane offset -> screen
+  const f = LAY.field, s = LAY.scale;
+  return { sx: f.x + x*s, sy: LAY.unitY + (yOff||0)*s };
+}
+
+/* ═══ GAME STATE ═════════════════════════════════════════════════════════ */
+const G = {
+  scene: 'menu',              // menu | map | battle | result | arsenal | codex
+  t: 0, shake: 0, flash: 0, hitstop: 0,
+  battle: null, result: null,
+  selCard: -1, hoverX: -1,
+  toast: null, toastT: 0,
+  bg: [], weather: [], scroll: 0,
+  menuSel: 0, scrollY: 0,
+};
+
+function toast(msg, col) { G.toast = { msg, col: col || '#ffd97a' }; G.toastT = 2.4; }
+
+/* ═══ BATTLE ════════════════════════════════════════════════════════════ */
+function makeSide(isPlayer, mission) {
+  let deck = isPlayer ? [...SAVE.deck] : [...mission.deck];
+  if (!deck.length) deck = ['runner'];                    // never hand out an empty deck
+  const hand = [], queue = [];
+  /* The queue must never run dry: cycleCard() shifts one and pushes one, so it
+     only holds steady if it starts full. Pad it by repeating the deck. */
+  const need = Math.max(CFG.HAND_SIZE, deck.length);
+  for (let i=0;i<need;i++) queue.push(deck[i % deck.length]);
+  for (let i=0;i<CFG.HAND_SIZE && queue.length;i++) hand.push(queue.shift());
+  return {
+    isPlayer, _dir: isPlayer ? 1 : -1, deck, hand, queue,
+    elixir: CFG.ELIXIR_START, elixirMax: CFG.ELIXIR_MAX,
+    baseHp:  isPlayer ? CFG.BASE_HP + mission.id * 112 : mission.baseHp,
+    baseMax: isPlayer ? CFG.BASE_HP + mission.id * 112 : mission.baseHp,
+    units: [], ai: { think: 0.9, react: mission.ai.react, rand: mission.ai.rand,
+                     patience: mission.ai.patience, greed: mission.ai.greed },
+  };
+}
+
+function startBattle(missionId) {
+  const m = CAMPAIGN[missionId];
+  /* Only rebuild the deck if the player's is not a legal 8 — otherwise respect
+     the deck they built themselves. */
+  const legal = SAVE.deck.length === CFG.DECK_SIZE &&
+                SAVE.deck.every(k => U[k] && SAVE.owned.includes(k));
+  if (!legal) SAVE.autoDeck();
+  G.battle = {
+    mission: m, theme: THEMES[m.theme], time: CFG.BATTLE_TIME,
+    p: makeSide(true, m), e: makeSide(false, m),
+    units: [], projectiles: [], parts: [], pops: [], spells: [],
+    uid: 1, over: false, overT: 0, double: false, shake:0, flash:0,
+    stats: { units:0, dmg:0, kills:0, deployed:{} },
+  };
+  G.scene = 'battle'; G.selCard = -1;
+  seedScenery(m.theme);
+  SAVE.registerDay();
+  Snd.init(); Snd.resume();
+}
+
+/* ═══ SCENERY ═══════════════════════════════════════════════════════════ */
+function seedScenery(themeName) {
+  G.bg = [];
+  const rnd = (a,b)=>a+Math.random()*(b-a);
+  // 3 parallax layers of silhouettes
+  const layers = [
+    { n:14, h:[0.30,0.55], sp:0.10, col:THEMES[themeName].far, w:[0.02,0.06] },
+    { n:10, h:[0.16,0.34], sp:0.22, col:THEMES[themeName].mid, w:[0.03,0.09] },
+    { n:20, h:[0.05,0.14], sp:0.45, col:THEMES[themeName].ground, w:[0.01,0.04] },
+  ];
+  layers.forEach((L, li) => {
+    for (let i=0;i<L.n;i++) G.bg.push({
+      layer:li, x: rnd(-0.1, 1.1), h: rnd(L.h[0], L.h[1]), w: rnd(L.w[0], L.w[1]),
+      sp: L.sp, col: L.col, seed: Math.random()*100, spikes: Math.random()<0.4,
+    });
+  });
+  G.weather = [];
+  const w = THEMES[themeName].weather;
+  if (w && !REDUCED) {
+    const n = w==='snow' ? 60 : (w==='ash' ? 44 : 110);
+    for (let i=0;i<n;i++) G.weather.push({
+      x: Math.random(), y: Math.random(), s: w==='rain'?rnd(0.4,0.9):rnd(0.3,1.1),
+      v: w==='rain'?rnd(1.6,2.6):rnd(0.2,0.6), drift: rnd(-0.3,0.3),
+    });
+  }
+}
+
+/* ═══ UNIT SPAWNING ═════════════════════════════════════════════════════ */
+function unitStats(type, isPlayer) {
+  const d = U[type];
+  const lv = isPlayer ? SAVE.lvl(type) : Math.max(1, Math.min(5, 1 + Math.floor(G.battle.mission.id/2.6)));
+  const g = 1 + (lv-1)*CFG.UPGRADE_GAIN;
+  return { hp:d.hp*g, dmg:d.dmg*g, heal:(d.heal||0)*g, lv };
+}
+
+function spawn(type, side, x, laneOff) {
+  const d = U[type]; if (!d || d.kind === 'spell') return;
+  const st = unitStats(type, side.isPlayer);
+  const n = d.count || 1;
+  for (let i=0;i<n;i++) {
+    const l = laneOff + (n>1 ? (i - (n-1)/2) * (WORLD.LANE*0.85) : 0);
+    const u = {
+      id: G.battle.uid++, type, def: d, side, isPlayer: side.isPlayer,
+      x: x + (n>1 ? (i-(n-1)/2)*8*side._dir : 0),
+      y: l, hp: st.hp, maxHp: st.hp, dmg: st.dmg, heal: st.heal, lv: st.lv,
+      cd: Math.random()*0.25, flash: 0, lunge: 0, walk: Math.random()*6.28,
+      target: null, dead: false, deathT: 0, r: d.r, facing: side._dir,
+      speedMul: 1, slowT: 0,
+    };
+    G.battle.units.push(u);
+  }
+  G.battle.stats.units++;
+}
+
+function castSpell(type, side, x, y) {
+  const d = U[type];
+  G.battle.spells.push({ x, y, t: 0, life: 0.85, dmg: d.dmg * (side.isPlayer ? (1+(SAVE.lvl(type)-1)*CFG.UPGRADE_GAIN) : 1),
+                         splash: d.splash, side, done:false });
+}
+
+/* ═══ COMBAT SIM ════════════════════════════════════════════════════════ */
+function damage(u, amt, src) {
+  if (u.dead) return;
+  u.hp -= amt; u.flash = 0.16;
+  if (src && src.isPlayer) G.battle.stats.dmg += amt;
+  if (u.hp <= 0) {
+    u.dead = true; u.deathT = 0;
+    if (src && src.isPlayer) G.battle.stats.kills++;
+    for (let i=0;i<(REDUCED?6:16);i++)
+      G.battle.parts.push({ x:u.x, y:u.y + Math.random()*10-5,
+        vx:(Math.random()-0.5)*140, vy:-Math.random()*150-30,
+        life:0.4+Math.random()*0.5, t:0, col:u.def.col, s:1.5+Math.random()*2.5 });
+  }
+}
+function aoe(x, y, radius, dmg, side) {
+  for (const u of G.battle.units) {
+    if (u.dead || u.isPlayer === side.isPlayer) continue;
+    const dx = u.x - x, dy = (u.y - y) * 0.6;
+    const d = Math.sqrt(dx*dx + dy*dy);
+    if (d <= radius + u.r) damage(u, dmg * (1 - 0.35 * Math.min(1, d/(radius+u.r))), side);
+  }
+  for (let i=0;i<(REDUCED?7:22);i++)
+    G.battle.parts.push({ x:x+(Math.random()-0.5)*radius*1.2, y:y+(Math.random()-0.5)*radius*0.7,
+      vx:(Math.random()-0.5)*260, vy:-Math.random()*200-40,
+      life:0.5+Math.random()*0.6, t:0, col:'#ffca6a', s:2+Math.random()*3 });
+  G.battle.pops.push({ x, y:y+18, text:'', dmg:0, t:0, life:0.4, kind:'blast', r:radius });
+}
+
+function baseFrontX(isPlayer) { return isPlayer ? WORLD.P_BASE_X + WORLD.BASE_W : WORLD.E_BASE_X; }
+
+function updateBattle(dt) {
+  const B = G.battle;
+  if (B.over) { B.overT += dt; if (B.overT > 0.8) finishBattle(); return; }
+
+  /* time + elixir */
+  B.time -= dt;
+  if (B.time <= CFG.DOUBLE_TIME) B.double = true;
+  const rate = CFG.ELIXIR_RATE * (B.double ? 2.2 : 1);
+  [B.p, B.e].forEach(s => { s.elixir = Math.min(s.elixirMax, s.elixir + rate*dt); });
+
+  if (B.time <= 0) { endBattle(B.p.baseHp >= B.e.baseHp); return; }
+  if (B.e.baseHp <= 0) { endBattle(true); return; }
+  if (B.p.baseHp <= 0) { endBattle(false); return; }
+
+  /* spells */
+  for (let i=B.spells.length-1;i>=0;i--) {
+    const s = B.spells[i]; s.t += dt;
+    if (!s.done && s.t >= s.life*0.72) {
+      s.done = true; aoe(s.x, s.y, s.splash, s.dmg, s.side);
+      Snd.boom(); B.shake = 20*MOTION; B.flash = 0.34*MOTION; G.hitstop = 0.05;
+    }
+    if (s.t >= s.life) B.spells.splice(i,1);
+  }
+
+  /* units */
+  for (const u of B.units) {
+    if (u.dead) { u.deathT += dt; continue; }
+    if (u.flash > 0) u.flash -= dt;
+    if (u.lunge > 0) u.lunge -= dt;
+    const d = u.def;
+    const dir = u.isPlayer ? 1 : -1;
+    u.facing = dir;
+
+    /* ── find a target ── */
+    let best = null, bestD = 1e9;
+    for (const o of B.units) {
+      if (o.dead || o.isPlayer === u.isPlayer) continue;
+      const ahead = (o.x - u.x) * dir;
+      if (ahead < -14) continue;                       // don't shoot behind
+      const dist = Math.abs(o.x - u.x);
+      if (dist < bestD) { bestD = dist; best = o; }
+    }
+    const lo = d.minR || 0;
+    const inRange = best && bestD <= d.range && bestD >= lo;
+
+    if (d.kind === 'heal') {
+      // heal the most-damaged friendly ahead
+      let tgt = null, worst = 0.82;
+      for (const f of B.units) {
+        if (f.dead || f.isPlayer !== u.isPlayer || f === u) continue;
+        if (Math.abs(f.x - u.x) > d.range) continue;
+        const frac = f.hp / f.maxHp; if (frac < worst) { worst = frac; tgt = f; }
+      }
+      if (tgt) {
+        u.cd -= dt;
+        if (u.cd <= 0) { u.cd = d.rate; tgt.hp = Math.min(tgt.maxHp, tgt.hp + u.heal); u.lunge = 0.2;
+          B.pops.push({ x:tgt.x, y:tgt.y+26, heal:Math.round(u.heal), t:0, life:0.7, kind:'heal' });
+          if (u.isPlayer) B.stats.dmg += u.heal; }
+      } else {
+        moveUnit(u, dt, dir, B);
+      }
+      continue;
+    }
+
+    if (inRange) {
+      u.cd -= dt;
+      if (u.cd <= 0) {
+        u.cd = d.rate; u.lunge = 0.24;
+        if (d.kind === 'ranged') {
+          B.projectiles.push({ x:u.x + dir*8, y:u.y, tx:best.x, ty:best.y, tgt:best.id,
+            sp: d.range > 200 ? 900 : 620, dmg:u.dmg, side:u, t:0, col:d.col,
+            big: d.range > 200, arc:false });
+          Snd.shot();
+        } else if (d.kind === 'splash') {
+          B.projectiles.push({ x:u.x + dir*8, y:u.y+8, tx:best.x, ty:best.y, tgt:0,
+            sp:520, dmg:u.dmg, side:u, t:0, col:d.col, arc:true, splash:d.splash });
+          Snd.heavy();
+        } else {
+          damage(best, u.dmg, u);
+          for (let i=0;i<(REDUCED?2:5);i++)
+            B.parts.push({ x:best.x-dir*6, y:best.y+(Math.random()-0.5)*10,
+              vx:-dir*(40+Math.random()*90), vy:-Math.random()*90,
+              life:0.28+Math.random()*0.3, t:0, col:d.col, s:1.4+Math.random()*2 });
+          if (d.dmg > 60) { B.shake = Math.max(B.shake, 7*MOTION); Snd.heavy(); } else Snd.shot();
+          B.pops.push({ x:best.x, y:best.y+18, dmg:Math.round(u.dmg), t:0, life:0.55, kind:'dmg' });
+        }
+      }
+    } else {
+      /* target the base if nothing is in the way and we've arrived */
+      const front = baseFrontX(!u.isPlayer);
+      const distToBase = Math.abs(front - u.x);
+      if (distToBase <= Math.max(d.range, 24)) {
+        u.cd -= dt;
+        if (u.cd <= 0) {
+          u.cd = d.rate;
+          const enemy = u.isPlayer ? B.e : B.p;
+          const dmgAmt = Math.round(u.dmg * CFG.CORE_DMG_MULT);
+          enemy.baseHp = Math.max(0, enemy.baseHp - dmgAmt);
+          if (u.isPlayer) B.stats.dmg += dmgAmt;
+          B.shake = Math.max(B.shake, 5*MOTION);
+          Snd.thump();
+          B.pops.push({ x:front, y:24+Math.random()*30, dmg:dmgAmt, t:0, life:0.7, kind:'base' });
+          for (let i=0;i<(REDUCED?3:9);i++)
+            B.parts.push({ x:front-dir*10, y:20+Math.random()*40, vx:-dir*(30+Math.random()*80),
+              vy:-Math.random()*120, life:0.4+Math.random()*0.5, t:0, col:'#ffb060', s:1.6+Math.random()*2.4 });
+          if (enemy.baseHp <= 0) { endBattle(u.isPlayer); return; }
+        }
+      } else {
+        moveUnit(u, dt, dir, B);
+      }
+    }
+  }
+
+  /* projectiles */
+  for (let i=B.projectiles.length-1;i>=0;i--) {
+    const p = B.projectiles[i]; p.t += dt;
+    const tx = p.tgt ? (B.units.find(x=>x.id===p.tgt) || {x:p.tx,y:p.ty}) : {x:p.tx,y:p.ty};
+    if (p.tgt && (tx.x === undefined)) { /* fall through */ }
+    const dx = (tx.x !== undefined ? tx.x : p.tx) - p.x;
+    const dy = (tx.y !== undefined ? tx.y : p.ty) - p.y;
+    const dist = Math.hypot(dx, dy);
+    const step = p.sp * dt;
+    if (dist <= step + 4) {
+      if (p.arc) { aoe(p.tx, p.ty, p.splash, p.dmg, p.side); }
+      else {
+        const tgt = p.tgt ? B.units.find(x=>x.id===p.tgt && !x.dead) : null;
+        if (tgt) { damage(tgt, p.dmg, p.side);
+          B.pops.push({ x:tgt.x, y:tgt.y+18, dmg:Math.round(p.dmg), t:0, life:0.5, kind:'dmg' }); }
+      }
+      for (let k=0;k<(REDUCED?2:4);k++)
+        B.parts.push({ x:p.tx, y:p.ty, vx:(Math.random()-0.5)*120, vy:-Math.random()*80,
+          life:0.2+Math.random()*0.24, t:0, col:p.col, s:1.4+Math.random()*2 });
+      B.projectiles.splice(i,1); continue;
+    }
+    p.x += dx/dist*step; p.y += dy/dist*step;
+    if (p.t > 3) B.projectiles.splice(i,1);
+  }
+
+  /* cull the dead */
+  for (let i=B.units.length-1;i>=0;i--) {
+    const u = B.units[i];
+    if (u.dead && u.deathT > 1.1) B.units.splice(i,1);
+  }
+
+  /* particles / pops */
+  for (let i=B.parts.length-1;i>=0;i--) {
+    const p = B.parts[i]; p.t += dt;
+    if (p.t >= p.life) { B.parts.splice(i,1); continue; }
+    p.vy += 340*dt; p.x += p.vx*dt; p.y += p.vy*dt; p.vx *= 0.97;
+  }
+  for (let i=B.pops.length-1;i>=0;i--) {
+    const p = B.pops[i]; p.t += dt;
+    if (p.t >= p.life) B.pops.splice(i,1); else p.y -= 34*dt;
+  }
+
+  B.shake *= Math.pow(0.002, dt);
+  B.flash *= Math.pow(0.002, dt);
+  B.p.elixir = Math.min(B.p.elixirMax, B.p.elixir);
+  aiUpdate(dt, B);
+}
+
+/* queue behaviour: units stop behind a friend ahead of them, forming a line */
+function moveUnit(u, dt, dir, B) {
+  const d = u.def;
+  let blocked = false;
+  for (const o of B.units) {
+    if (o === u || o.dead || o.isPlayer !== u.isPlayer) continue;
+    const ahead = (o.x - u.x) * dir;
+    if (ahead > 0 && ahead < u.r + o.r + 3) { blocked = true; break; }
+  }
+  if (!blocked) u.x += dir * d.speed * dt;
+  u.walk += dt * (d.speed * 0.09);
+}
+
+/* ═══ AI ════════════════════════════════════════════════════════════════ */
+function aiUpdate(dt, B) {
+  const ai = B.e, foe = B.p, cfg = ai.ai;
+  ai.ai.think -= dt;
+  if (ai.ai.think > 0) return;
+  ai.ai.think = cfg.react * (0.75 + Math.random()*0.7);
+  if (ai.elixir < 1) return;
+
+  const threats = foe.units.filter(u => !u.dead);
+  const nearBase = threats.filter(u => u.x > WORLD.E_DEPLOY[0]).length;
+  let wantSplash = 0, wantRange = 0, wantBody = 0;
+  for (const t of threats) {
+    if (t.type === 'swarm') wantSplash += 2.4;
+    if (t.def.hp >= 600) wantRange += 2.2;
+    if (t.def.kind === 'melee') wantSplash += 0.8;
+    if (t.x > 780) wantBody += 1.6;
+  }
+  wantSplash += nearBase * 0.9;
+  wantBody += nearBase * 0.7;
+
+  // sometimes hold resources to build a real push
+  if (!threats.length && ai.elixir < 5 && Math.random() < cfg.patience) return;
+
+  let pick = null, pickScore = -1e9;
+  for (const k of ai.hand) {
+    const d = U[k];
+    if (!d) continue;
+    if (d.cost > ai.elixir) continue;
+    let s = 0.6 + Math.random() * cfg.rand * 2.2;
+    if (k === 'strike') { s += wantSplash > 1.5 ? 3.2 : -4.5; }
+    else if (d.kind === 'splash') s += wantSplash * 1.25;
+    else if (d.kind === 'heal')  s += (threats.length + (ai.units.length||0)) > 3 ? 1.4 : -0.8;
+    else if (d.kind === 'ranged') s += wantRange * 1.0 + wantSplash * 0.2;
+    else if (d.kind === 'melee') s += wantBody * 0.8;
+    if (d.cost >= 5) s += (ai.elixir >= 8 ? 1.8 : -2.2) * cfg.greed;
+    s -= (d.cost > ai.elixir) ? 100 : 0;
+    if (s > pickScore) { pickScore = s; pick = k; }
+  }
+  if (!pick) return;
+
+  const d = U[pick];
+  if (d.kind === 'spell') {
+    let tx = 700, ty = 0;
+    if (threats.length) {
+      // hit the densest cluster
+      let bestN = 0;
+      for (const t of threats) {
+        const n = threats.filter(o => Math.abs(o.x-t.x) < d.splash).length;
+        if (n > bestN) { bestN = n; tx = t.x; ty = t.y; }
+      }
+    } else { tx = WORLD.E_DEPLOY[0] + 60; }
+    castSpell(pick, ai, Math.max(120, Math.min(1080, tx)), ty);
+  } else {
+    // place in own half, pushed forward when defending
+    let x = nearBase > 0 ? WORLD.E_DEPLOY[0] + 30 : WORLD.E_DEPLOY[0] + 110 + Math.random()*260;
+    x = Math.max(WORLD.E_DEPLOY[0], Math.min(WORLD.E_DEPLOY[1], x));
+    spawn(pick, ai, x, (Math.random()-0.5)*WORLD.LANE*0.8);
+  }
+  ai.elixir -= d.cost;
+  cycleCard(ai, pick);
+  Snd.deploy();
+}
+
+/* ═══ CARD CYCLING ══════════════════════════════════════════════════════ */
+function cycleCard(side, key) {
+  const i = side.hand.indexOf(key); if (i < 0) return;
+  const next = side.queue.shift(); side.queue.push(key);
+  side.hand[i] = next;
+}
+
+function endBattle(playerWon) {
+  const B = G.battle; if (B.over) return;
+  B.over = true; B.overT = 0; B.playerWon = playerWon;
+}
+function finishBattle() {
+  const B = G.battle;
+  const won = B.playerWon;
+  if (won) { SAVE.wins++; SAVE.cleared = Math.max(SAVE.cleared, B.mission.id + 1);
+             SAVE.gold += B.mission.reward + Math.round(40 * (1 - B.time/CFG.BATTLE_TIME));
+             SAVE.missionStars[B.mission.id] = Math.max(SAVE.missionStars[B.mission.id]||0, B.p.baseHp/B.p.baseMax > 0.6 ? 3 : (B.p.baseHp/B.p.baseMax > 0.3 ? 2 : 1));
+             if (B.mission.unlock && !SAVE.owned.includes(B.mission.unlock)) { SAVE.owned.push(B.mission.unlock); }
+             Snd.win(); }
+  else { SAVE.losses++; Snd.lose(); }
+  SAVE.totalUnits += B.stats.units; SAVE.totalDamage += Math.round(B.stats.dmg);
+  SAVE.save();
+  G.result = { won, mission: B.mission, stats: B.stats, baseLeft: B.p.baseHp, baseMax: B.p.baseMax };
+  G.scene = 'result';
+}
+
+/* ═══ DECK BUILDING ════════════════════════════════════════════════════ */
+function deckHas(k) { return SAVE.deck.includes(k); }
+function toggleDeck(k) {
+  const i = SAVE.deck.indexOf(k);
+  if (i >= 0) {
+    if (SAVE.deck.length <= CFG.HAND_SIZE) { Snd.err(); toast('DECK NEEDS AT LEAST '+CFG.HAND_SIZE, '#ff7b7b'); return; }
+    SAVE.deck.splice(i,1); toast(U[k].name+' REMOVED', '#ff9a9a');
+  } else {
+    if (SAVE.deck.length >= CFG.DECK_SIZE) { Snd.err(); toast('DECK IS FULL — REMOVE ONE FIRST', '#ff7b7b'); return; }
+    SAVE.deck.push(k); toast(U[k].name+' ADDED TO DECK', '#9dffb0');
+  }
+  SAVE.save();
+}
+function deckAvgCost() {
+  if (!SAVE.deck.length) return 0;
+  return SAVE.deck.reduce((a,k)=>a+U[k].cost,0)/SAVE.deck.length;
+}
+
+/* ═══ PLAYER ACTIONS ════════════════════════════════════════════════════ */
+function playerDeploy(cardIdx, wx, wy) {
+  const B = G.battle; if (!B || B.over) return;
+  const key = B.p.hand[cardIdx]; if (!key) return;
+  const d = U[key]; if (!d) return;
+  if (d.cost > B.p.elixir) { Snd.err(); toast('NOT ENOUGH ELIXIR', '#ff7b7b'); return; }
+  if (d.kind === 'spell') {
+    if (wx < 30 || wx > WORLD.W-30) return;
+    castSpell(key, B.p, wx, Math.max(-WORLD.LANE, Math.min(WORLD.LANE, wy)));
+  } else {
+    if (wx < WORLD.P_DEPLOY[0] || wx > WORLD.P_DEPLOY[1]) { Snd.err(); toast('DEPLOY IN YOUR OWN HALF', '#ff7b7b'); return; }
+    spawn(key, B.p, wx, Math.max(-WORLD.LANE, Math.min(WORLD.LANE, wy*(0.9))));
+  }
+  B.p.elixir -= d.cost;
+  cycleCard(B.p, key);
+  B.stats.deployed[key] = (B.stats.deployed[key]||0) + 1;
+  G.selCard = -1;
+  Snd.deploy();
+}
+
+/* ═══ INPUT ════════════════════════════════════════════════════════════ */
+function ptToWorld(px, py) {
+  const f = LAY.field, s = LAY.scale;
+  const wx = (px - f.x) / s;
+  const wy = (py - LAY.unitY) / s;
+  return { wx, wy };
+}
+function inside(p, r) { return p.x >= r.x && p.x <= r.x+r.w && p.y >= r.y && p.y <= r.y+r.h; }
+
+function tap(px, py) {
+  Snd.init(); Snd.resume();
+  const B = G.battle;
+
+  if (G.scene === 'battle') {
+    if (B.over) return;
+    // card bar?
+    for (let i=0;i<LAY.cards.length;i++) {
+      if (inside({x:px,y:py}, LAY.cards[i])) {
+        const key = B.p.hand[i];
+        if (U[key] && U[key].cost <= B.p.elixir) {
+          G.selCard = (G.selCard === i) ? -1 : i; Snd.select();
+        } else { Snd.err(); }
+        return;
+      }
+    }
+    if (G.selCard >= 0) {
+      const w = ptToWorld(px, py);
+      playerDeploy(G.selCard, w.wx, w.wy);
+    }
+    return;
+  }
+
+  if (G.scene === 'menu') {
+    // buttons laid out in drawMenu and cached
+    for (const b of (G._menuBtns||[])) if (inside({x:px,y:py}, b)) { Snd.select(); b.act(); return; }
+    return;
+  }
+  if (G.scene === 'map') {
+    for (const b of (G._mapBtns||[])) if (inside({x:px,y:py}, b)) { Snd.select(); b.act(); return; }
+    return;
+  }
+  if (G.scene === 'result') {
+    for (const b of (G._resBtns||[])) if (inside({x:px,y:py}, b)) { Snd.select(); b.act(); return; }
+    return;
+  }
+  if (G.scene === 'arsenal') {
+    for (const b of (G._arsBtns||[])) if (inside({x:px,y:py}, b)) { Snd.select(); b.act(); return; }
+    return;
+  }
+  if (G.scene === 'codex') {
+    for (const b of (G._codBtns||[])) if (inside({x:px,y:py}, b)) { Snd.select(); b.act(); return; }
+    return;
+  }
+}
+
+let pDown = null;
+cvs.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  pDown = { x:e.clientX, y:e.clientY, t:performance.now() };
+  /* the battle is real-time: respond on press, not on release */
+  if (G.scene === 'battle') tap(e.clientX, e.clientY);
+}, { passive:false });
+cvs.addEventListener('pointerup', e => {
+  if (!pDown) return;
+  const moved = Math.hypot(e.clientX - pDown.x, e.clientY - pDown.y);
+  const held = performance.now() - pDown.t;
+  /* menus: only a deliberate tap counts, so dragging to scroll never fires a button */
+  if (G.scene !== 'battle' && moved < 12 && held < 600) tap(e.clientX, e.clientY);
+  pDown = null;
+}, { passive:true });
+cvs.addEventListener('pointercancel', () => { pDown = null; }, { passive:true });
+cvs.addEventListener('pointermove', e => {
+  if (G.scene !== 'battle') return;
+  const w = ptToWorld(e.clientX, e.clientY); G.hoverX = w.wx;
+}, { passive:true });
+cvs.addEventListener('pointerleave', () => { G.hoverX = -1; });
+window.addEventListener('keydown', e => {
+  if (e.code === 'KeyM') { Snd.init(); Snd.toggle(); toast(Snd.muted ? 'MUTED' : 'SOUND ON'); }
+  if (G.scene === 'battle' && e.code >= 'Digit1' && e.code <= 'Digit4') {
+    const i = parseInt(e.code.slice(5),10)-1; const B = G.battle;
+    if (B && !B.over) { const k = B.p.hand[i]; if (k && U[k].cost <= B.p.elixir) { G.selCard = i; Snd.select(); } }
+  }
+  if (e.code === 'Escape' && G.scene === 'battle') { G.selCard = -1; }
+}, { passive:true });
+document.addEventListener('gesturestart', e => e.preventDefault());
+document.addEventListener('touchmove', e => e.preventDefault(), { passive:false });
+
+/* ═══ RENDER HELPERS ═══════════════════════════════════════════════════ */
+function rr(x,y,w,h,r) { r = Math.min(r, w/2, h/2);
+  ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+function txt(s,x,y,size,col,align,weight) {
+  ctx.fillStyle = col; ctx.textAlign = align||'center';
+  ctx.font = `${weight||700} ${size}px "Helvetica Neue",Helvetica,Arial,sans-serif`;
+  ctx.fillText(s,x,y);
+}
+function bar(x,y,w,h,frac,col,bg) {
+  ctx.fillStyle = bg || 'rgba(0,0,0,0.55)'; rr(x,y,w,h,h/2); ctx.fill();
+  if (frac > 0) { ctx.fillStyle = col; rr(x,y,Math.max(h, w*frac),h,h/2); ctx.fill(); }
+}
+
+/* ═══ UNIT DRAWING — procedural silhouettes with distinct reads ════════ */
+function drawUnit(u) {
+  const s = LAY.scale, f = LAY.field;
+  const p = w2s(u.x, u.y);
+  const cx = p.sx, gy = p.sy;
+  const dead = u.dead;
+  const dT = dead ? Math.min(1, u.deathT/1.1) : 0;
+
+  ctx.save();
+  ctx.translate(cx, gy);
+  if (dead) { ctx.globalAlpha = 1-dT; ctx.rotate(-u.facing*dT*1.35); ctx.translate(0, dT*6); }
+
+  const sc = s * (0.85 + (u.lv-1)*0.05);
+  const dir = u.facing;
+  const walk = Math.sin(u.walk) * (u.def.speed > 60 ? 1 : 0.5);
+  const lunge = u.lunge > 0 ? (1 - u.lunge/0.24) * 6 : 0;
+  const ox = dir * lunge;
+
+  /* shadow */
+  ctx.fillStyle = 'rgba(0,0,0,0.42)';
+  ctx.beginPath(); ctx.ellipse(0, 2*sc, (u.r+3)*sc, (u.r*0.4+2)*sc, 0, 0, 6.29); ctx.fill();
+
+  ctx.scale(dir, 1);          // everything drawn facing right
+  ctx.translate(ox*sc, 0);
+  const col = u.flash > 0 ? '#ffffff' : u.def.col;
+  const dark = u.flash > 0 ? '#ffffff' : shadeHex(u.def.col, -58);
+  const lite = u.flash > 0 ? '#ffffff' : shadeHex(u.def.col, 46);
+  const R = u.r * sc;
+
+  const legW = Math.max(1.4, R*0.22);
+
+  switch (u.def.shape) {
+
+  case 'runner': {
+    ctx.fillStyle = dark;
+    ctx.fillRect(-R*0.22, -R*0.55, legW, R*0.55 + walk*R*0.22);
+    ctx.fillRect(R*0.10, -R*0.55, legW, R*0.55 - walk*R*0.22);
+    ctx.fillStyle = col;
+    rr(-R*0.62, -R*1.75, R*1.24, R*1.24, R*0.34); ctx.fill();
+    ctx.fillStyle = lite; rr(-R*0.62, -R*1.75, R*1.24, R*0.42, R*0.3); ctx.fill();
+    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(0, -R*2.0, R*0.42, 0, 6.29); ctx.fill();
+    break;
+  }
+  case 'rifle': {
+    ctx.fillStyle = dark;
+    ctx.fillRect(-R*0.30, -R*0.62, legW, R*0.62 + walk*R*0.26);
+    ctx.fillRect(R*0.14, -R*0.62, legW, R*0.62 - walk*R*0.26);
+    ctx.fillStyle = col;
+    rr(-R*0.70, -R*1.95, R*1.40, R*1.42, R*0.30); ctx.fill();
+    ctx.fillStyle = dark; rr(-R*0.70, -R*1.30, R*1.40, R*0.30, 2); ctx.fill();
+    ctx.fillStyle = lite; ctx.beginPath(); ctx.arc(0, -R*2.22, R*0.46, 0, 6.29); ctx.fill();
+    ctx.fillStyle = '#2b2f3a';                       // rifle
+    ctx.fillRect(R*0.2, -R*1.42, R*1.85, Math.max(1.6,R*0.28));
+    ctx.fillRect(R*0.62, -R*1.22, R*0.24, R*0.34);
+    break;
+  }
+  case 'shield': {
+    ctx.fillStyle = dark;
+    ctx.fillRect(-R*0.34, -R*0.72, legW*1.3, R*0.72 + walk*R*0.16);
+    ctx.fillRect(R*0.16, -R*0.72, legW*1.3, R*0.72 - walk*R*0.16);
+    ctx.fillStyle = col;
+    rr(-R*0.86, -R*2.10, R*1.72, R*1.50, R*0.26); ctx.fill();
+    ctx.fillStyle = lite; ctx.beginPath(); ctx.arc(0, -R*2.42, R*0.52, 0, 6.29); ctx.fill();
+    ctx.fillStyle = shadeHex(u.def.col, -18);        // big shield
+    rr(R*0.62, -R*2.20, R*0.90, R*2.30, R*0.22); ctx.fill();
+    ctx.fillStyle = lite; rr(R*0.72, -R*2.00, R*0.66, R*0.22, 2); ctx.fill();
+    break;
+  }
+  case 'drone': {
+    const spin = performance.now()*0.02;
+    ctx.strokeStyle = shadeHex(u.def.col, -40);
+    ctx.lineWidth = Math.max(1.2, R*0.18);
+    ctx.beginPath(); ctx.moveTo(-R*1.1, -R*1.3); ctx.lineTo(R*1.1, -R*1.3); ctx.stroke();
+    ctx.save(); ctx.translate(-R*1.1, -R*1.34); ctx.rotate(spin); 
+    ctx.strokeStyle = lite; ctx.beginPath(); ctx.moveTo(-R*0.6,0); ctx.lineTo(R*0.6,0); ctx.stroke(); ctx.restore();
+    ctx.save(); ctx.translate(R*1.1, -R*1.34); ctx.rotate(-spin);
+    ctx.strokeStyle = lite; ctx.beginPath(); ctx.moveTo(-R*0.6,0); ctx.lineTo(R*0.6,0); ctx.stroke(); ctx.restore();
+    ctx.fillStyle = col;
+    ctx.beginPath(); ctx.moveTo(0,-R*1.75); ctx.lineTo(R*0.62,-R*1.05);
+    ctx.lineTo(0,-R*0.55); ctx.lineTo(-R*0.62,-R*1.05); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = u.flash>0?'#fff':'#ff5a5a';
+    ctx.beginPath(); ctx.arc(0,-R*1.1,R*0.20,0,6.29); ctx.fill();
+    break;
+  }
+  case 'gren': {
+    ctx.fillStyle = dark;
+    ctx.fillRect(-R*0.30, -R*0.60, legW, R*0.60 + walk*R*0.24);
+    ctx.fillRect(R*0.14, -R*0.60, legW, R*0.60 - walk*R*0.24);
+    ctx.fillStyle = col;
+    rr(-R*0.80, -R*1.70, R*1.60, R*1.20, R*0.44); ctx.fill();
+    ctx.fillStyle = lite; ctx.beginPath(); ctx.arc(0, -R*1.98, R*0.46, 0, 6.29); ctx.fill();
+    ctx.fillStyle = '#3a3f4d';                       // short tube
+    ctx.fillRect(R*0.34, -R*1.62, R*1.0, Math.max(2.4,R*0.46));
+    ctx.fillStyle = u.flash>0?'#fff':'#ffd08a';
+    ctx.beginPath(); ctx.arc(R*1.34,-R*1.40,R*0.22,0,6.29); ctx.fill();
+    break;
+  }
+  case 'sniper': {
+    ctx.fillStyle = dark;
+    ctx.fillRect(-R*0.26, -R*0.66, legW*0.9, R*0.66 + walk*R*0.1);
+    ctx.fillRect(R*0.12, -R*0.66, legW*0.9, R*0.66 - walk*R*0.1);
+    ctx.fillStyle = col;
+    rr(-R*0.56, -R*2.10, R*1.12, R*1.50, R*0.26); ctx.fill();
+    ctx.fillStyle = lite; ctx.beginPath(); ctx.arc(0, -R*2.36, R*0.40, 0, 6.29); ctx.fill();
+    ctx.fillStyle = '#22262f';                       // very long barrel
+    ctx.fillRect(R*0.2, -R*1.62, R*3.1, Math.max(1.6,R*0.22));
+    ctx.fillRect(R*0.9, -R*1.86, R*0.5, Math.max(1.4,R*0.3));
+    break;
+  }
+  case 'medic': {
+    ctx.fillStyle = dark;
+    ctx.fillRect(-R*0.28, -R*0.60, legW, R*0.60 + walk*R*0.22);
+    ctx.fillRect(R*0.12, -R*0.60, legW, R*0.60 - walk*R*0.22);
+    ctx.fillStyle = col;
+    rr(-R*0.66, -R*1.80, R*1.32, R*1.30, R*0.30); ctx.fill();
+    ctx.fillStyle = lite; ctx.beginPath(); ctx.arc(0, -R*2.06, R*0.44, 0, 6.29); ctx.fill();
+    ctx.fillStyle = '#0d2a14';                       // cross
+    ctx.fillRect(-R*0.11, -R*1.55, R*0.22, R*0.85);
+    ctx.fillRect(-R*0.43, -R*1.24, R*0.86, R*0.22);
+    break;
+  }
+  case 'mech': {
+    const stomp = Math.sin(u.walk)*R*0.14;
+    ctx.fillStyle = dark;
+    rr(-R*0.72, -R*0.95, R*0.52, R*0.95 + stomp, R*0.16); ctx.fill();
+    rr(R*0.20, -R*0.95, R*0.52, R*0.95 - stomp, R*0.16); ctx.fill();
+    ctx.fillStyle = col;
+    rr(-R*1.05, -R*2.55, R*2.10, R*1.68, R*0.34); ctx.fill();
+    ctx.fillStyle = lite; rr(-R*1.05, -R*2.55, R*2.10, R*0.5, R*0.3); ctx.fill();
+    ctx.fillStyle = dark; rr(-R*1.22, -R*2.30, R*0.44, R*1.5, R*0.2); ctx.fill();
+    rr(R*0.78, -R*2.30, R*0.44, R*1.5, R*0.2); ctx.fill();
+    ctx.fillStyle = shadeHex(u.def.col, -30);
+    rr(-R*0.42, -R*3.05, R*0.84, R*0.55, R*0.18); ctx.fill();
+    ctx.fillStyle = u.flash>0?'#fff':'#fff08a';      // visor
+    ctx.fillRect(-R*0.62, -R*2.22, R*1.24, Math.max(2, R*0.26));
+    break;
+  }
+  case 'mortar': {
+    ctx.fillStyle = dark;
+    ctx.beginPath(); ctx.moveTo(-R*1.1,-R*0.1); ctx.lineTo(R*1.1,-R*0.1);
+    ctx.lineTo(R*0.72,-R*1.15); ctx.lineTo(-R*0.72,-R*1.15); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = col;
+    ctx.beginPath(); ctx.moveTo(-R*0.86,-R*0.2); ctx.lineTo(R*0.86,-R*0.2);
+    ctx.lineTo(R*0.56,-R*1.0); ctx.lineTo(-R*0.56,-R*1.0); ctx.closePath(); ctx.fill();
+    ctx.save(); ctx.translate(0,-R*1.0); ctx.rotate(-0.9 + (u.lunge>0? -0.28:0));
+    ctx.fillStyle = col; rr(0,-R*0.30, R*2.3, R*0.60, R*0.16); ctx.fill();
+    ctx.fillStyle = lite; rr(R*1.9,-R*0.32, R*0.34, R*0.64, R*0.14); ctx.fill();
+    ctx.restore();
+    ctx.fillStyle = lite; ctx.beginPath(); ctx.arc(-R*0.5,-R*0.62,R*0.24,0,6.29); ctx.fill();
+    break;
+  }
+  default: {
+    ctx.fillStyle = col;
+    rr(-R*0.7,-R*1.6,R*1.4,R*1.6,R*0.3); ctx.fill();
+  }
+  }
+  ctx.restore();
+
+  /* health bar */
+  if (!dead && u.hp < u.maxHp) {
+    const frac = Math.max(0, u.hp/u.maxHp);
+    const bw = (u.r*2.4)*s, bh = Math.max(2.6, 3.4*s);
+    const bx = cx-bw/2, by = gy - (u.def.shape==='mech'? 5.5 : (u.def.shape==='sniper'? 4.4 : 3.9))*s*1.0 - u.r*s*1.6;
+    ctx.fillStyle = 'rgba(0,0,0,0.66)'; rr(bx,by,bw,bh,bh/2); ctx.fill();
+    ctx.fillStyle = u.isPlayer ? (frac>0.5?'#5ce08a':(frac>0.25?'#ffd35c':'#ff6b6b'))
+                               : (frac>0.5?'#ff7b7b':(frac>0.25?'#ff9a4d':'#ffb3b3'));
+    rr(bx,by,bw*frac,bh,bh/2); ctx.fill();
+    if (u.lv > 1) txt('L'+u.lv, cx + bw/2 + 5*s, by+bh, Math.max(7, 7*s*1.4), 'rgba(255,255,255,0.6)', 'left', 800);
+  }
+}
+
+function shadeHex(hex, amt) {
+  if (!hex || hex[0] !== '#') return hex;
+  const n = parseInt(hex.slice(1), 16);
+  const c = v => Math.max(0, Math.min(255, Math.round(v+amt))).toString(16).padStart(2,'0');
+  return '#'+c((n>>16)&255)+c((n>>8)&255)+c(n&255);
+}
+
+/* ═══ BATTLE RENDER ═════════════════════════════════════════════════════ */
+function drawBattle() {
+  const B = G.battle, th = B.theme, f = LAY.field, s = LAY.scale;
+  if (!B) return;
+
+  /* sky */
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, th.sky[0]); g.addColorStop(0.55, th.sky[1]); g.addColorStop(1, th.sky[2]);
+  ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+
+  /* parallax silhouettes */
+  ctx.save(); ctx.beginPath(); ctx.rect(f.x-40, 0, f.w+80, LAY.unitY+10); ctx.clip();
+  for (const b of G.bg) {
+    const drift = b.layer === 0 ? Math.sin(G.t*0.06 + b.seed) * 5 : 0;
+    const bx = f.x + ((b.x*1.4 - 0.2) * f.w) + drift;
+    const bh = b.h * (LAY.unitY*0.62);
+    ctx.fillStyle = b.col;
+    ctx.beginPath();
+    if (b.spikes) {
+      ctx.moveTo(bx, LAY.unitY);
+      ctx.lineTo(bx + b.w*f.w*0.5, LAY.unitY - bh*1.5);
+      ctx.lineTo(bx + b.w*f.w, LAY.unitY);
+    } else {
+      const bw = b.w*f.w;
+      ctx.moveTo(bx, LAY.unitY);
+      ctx.lineTo(bx, LAY.unitY-bh);
+      ctx.lineTo(bx+bw*0.30, LAY.unitY-bh*1.22);
+      ctx.lineTo(bx+bw*0.62, LAY.unitY-bh*0.94);
+      ctx.lineTo(bx+bw, LAY.unitY-bh*1.05);
+      ctx.lineTo(bx+bw, LAY.unitY);
+    }
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.fillStyle = th.fog; ctx.fillRect(f.x-40, 0, f.w+80, LAY.unitY+10);
+  ctx.restore();
+
+  /* ground */
+  ctx.fillStyle = th.ground;
+  ctx.fillRect(f.x-40, LAY.unitY, f.w+80, H-LAY.unitY+40);
+  ctx.strokeStyle = th.gline; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(f.x-40, LAY.unitY); ctx.lineTo(f.x+f.w+40, LAY.unitY); ctx.stroke();
+  ctx.strokeStyle = 'rgba(255,255,255,0.045)'; ctx.lineWidth = 1;
+  for (let i=0;i<26;i++) {
+    const gx = f.x + (i/26)*f.w + ((G.scroll*0.5)%(f.w/26));
+    ctx.beginPath(); ctx.moveTo(gx, LAY.unitY+1); ctx.lineTo(gx-10, LAY.unitY+18); ctx.stroke();
+  }
+
+  /* deploy zone hint */
+  if (G.selCard >= 0 && B.p.hand[G.selCard] && U[B.p.hand[G.selCard]].kind !== 'spell') {
+    const a = 0.10 + 0.05*Math.sin(G.t*6);
+    ctx.fillStyle = `rgba(90,200,255,${a})`;
+    ctx.fillRect(f.x + WORLD.P_DEPLOY[0]*s, LAY.unitY-6, (WORLD.P_DEPLOY[1]-WORLD.P_DEPLOY[0])*s, 20);
+    ctx.strokeStyle = 'rgba(120,220,255,0.5)'; ctx.lineWidth = 1.5;
+    ctx.strokeRect(f.x + WORLD.P_DEPLOY[0]*s, LAY.unitY-6, (WORLD.P_DEPLOY[1]-WORLD.P_DEPLOY[0])*s, 20);
+  }
+  if (G.selCard >= 0 && B.p.hand[G.selCard] && U[B.p.hand[G.selCard]].kind === 'spell') {
+    const a = 0.09 + 0.05*Math.sin(G.t*6);
+    ctx.fillStyle = `rgba(255,190,60,${a})`; ctx.fillRect(f.x, LAY.unitY-90*s, f.w, 140*s);
+    ctx.strokeStyle = 'rgba(255,200,80,0.55)'; ctx.lineWidth = 1.5;
+    ctx.strokeRect(f.x, LAY.unitY-90*s, f.w, 140*s);
+  }
+
+  /* bases */
+  drawBase(WORLD.P_BASE_X, B.p, true, th);
+  drawBase(WORLD.E_BASE_X, B.e, false, th);
+
+  /* units, sorted by lane depth so nearer units draw on top */
+  const ordered = B.units.slice().sort((a,b) => a.y - b.y);
+  for (const u of ordered) drawUnit(u);
+
+  /* projectiles */
+  for (const p of B.projectiles) {
+    const a = w2s(p.x, p.y), b2 = w2s(p.tx, p.ty);
+    if (p.arc) {
+      const k = Math.min(1, p.t*1.6);
+      const mx = (a.sx+b2.sx)/2, my = Math.min(a.sy,b2.sy) - 46*s;
+      const x = (1-k)*(1-k)*a.sx + 2*(1-k)*k*mx + k*k*b2.sx;
+      const y = (1-k)*(1-k)*a.sy + 2*(1-k)*k*my + k*k*b2.sy;
+      ctx.fillStyle = p.col; ctx.beginPath(); ctx.arc(x,y,3*s*1.6,0,6.29); ctx.fill();
+      ctx.strokeStyle = p.col+'55'; ctx.lineWidth = 2*s; ctx.beginPath();
+      ctx.moveTo(a.sx,a.sy); ctx.lineTo(x,y); ctx.stroke();
+    } else {
+      ctx.strokeStyle = p.col; ctx.lineWidth = Math.max(1.2, (p.big?2.4:1.6)*s);
+      ctx.beginPath(); ctx.moveTo(a.sx,a.sy); ctx.lineTo(b2.sx,b2.sy); ctx.stroke();
+      ctx.fillStyle = p.col; ctx.beginPath(); ctx.arc(b2.sx,b2.sy, Math.max(1.4,(p.big?2.6:1.8)*s),0,6.29); ctx.fill();
+    }
+  }
+
+  /* spells */
+  for (const sp of B.spells) {
+    const p = w2s(sp.x, sp.y), k = sp.t/sp.life;
+    if (k < 0.72) {
+      // incoming marker
+      const a = 0.25 + 0.45*k;
+      ctx.strokeStyle = `rgba(255,190,60,${a})`; ctx.lineWidth = 2;
+      const rr2 = (1-k*1.15) * 44*s;
+      ctx.beginPath(); ctx.arc(p.sx, LAY.unitY-4, Math.max(4,rr2), 0, 6.29); ctx.stroke();
+      ctx.beginPath(); ctx.arc(p.sx, LAY.unitY-4, 3, 0, 6.29); ctx.fillStyle='rgba(255,210,110,0.9)'; ctx.fill();
+      // falling shell
+      const fall = (k/0.72);
+      const sx2 = p.sx, sy2 = -40 + fall*(LAY.unitY-8);
+      ctx.fillStyle = '#ffe08a'; 
+      ctx.beginPath(); ctx.ellipse(sx2,sy2,4*s,7*s,0,0,6.29); ctx.fill();
+    } else if (!sp.done) {
+      // nothing; blast handled below
+    }
+    if (k >= 0.72) {
+      const bk = (k-0.72)/0.28;
+      ctx.globalAlpha = Math.max(0, 1-bk);
+      const rad = (0.3+bk)*sp.splash*s*(2.0);
+      const gr = ctx.createRadialGradient(p.sx,LAY.unitY-6,0,p.sx,LAY.unitY-6,rad);
+      gr.addColorStop(0,'rgba(255,255,220,0.95)');
+      gr.addColorStop(0.35,'rgba(255,190,70,0.7)');
+      gr.addColorStop(1,'rgba(255,90,30,0)');
+      ctx.fillStyle = gr; ctx.beginPath(); ctx.arc(p.sx, LAY.unitY-6, rad, 0, 6.29); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  /* particles */
+  for (const p of B.parts) {
+    const k = 1 - p.t/p.life, q = w2s(p.x, p.y);
+    ctx.globalAlpha = k; ctx.fillStyle = p.col;
+    ctx.beginPath(); ctx.arc(q.sx, q.sy, Math.max(0.6, p.s*(0.6+k*0.8)*s*1.15), 0, 6.29); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  /* damage / heal numbers */
+  for (const p of B.pops) {
+    const q = w2s(p.x, p.y), k = 1 - p.t/p.life;
+    ctx.globalAlpha = Math.min(1, k*1.9);
+    if (p.kind === 'dmg') {
+      txt(String(p.dmg), q.sx, q.sy, Math.max(9, 11*s*1.6), '#fff8e0', 'center', 800);
+    } else if (p.kind === 'base') {
+      txt('-'+p.dmg, q.sx, q.sy, Math.max(10, 12*s*1.7), '#ffd06a', 'center', 900);
+    } else if (p.kind === 'heal') {
+      txt('+'+p.heal, q.sx, q.sy, Math.max(9, 10*s*1.6), '#8dffb0', 'center', 800);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /* weather */
+  drawWeather(th);
+
+  /* vignette */
+  const vg = ctx.createRadialGradient(W/2,H*0.42,H*0.15,W/2,H*0.5,H*0.85);
+  vg.addColorStop(0,'rgba(0,0,0,0)'); vg.addColorStop(1,'rgba(0,0,0,0.5)');
+  ctx.fillStyle = vg; ctx.fillRect(0,0,W,H);
+}
+
+function drawWeather(th) {
+  const w = th.weather; if (!w) return;
+  ctx.save();
+  if (w === 'rain') {
+    ctx.strokeStyle = 'rgba(170,205,255,0.35)'; ctx.lineWidth = 1;
+    for (const d of G.weather) {
+      const x = d.x*W, y = d.y*H;
+      ctx.beginPath(); ctx.moveTo(x,y); ctx.lineTo(x - 3, y + 14*d.s); ctx.stroke();
+    }
+  } else if (w === 'snow') {
+    ctx.fillStyle = 'rgba(220,235,255,0.7)';
+    for (const d of G.weather) { ctx.beginPath(); ctx.arc(d.x*W, d.y*H, d.s*1.5, 0, 6.29); ctx.fill(); }
+  } else if (w === 'ash') {
+    for (const d of G.weather) {
+      ctx.fillStyle = d.s > 0.7 ? 'rgba(255,140,80,0.55)' : 'rgba(180,170,170,0.3)';
+      ctx.beginPath(); ctx.arc(d.x*W, d.y*H, d.s*1.3, 0, 6.29); ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
+function drawBase(x, side, isPlayer, th) {
+  const f = LAY.field, s = LAY.scale;
+  const p = w2s(x, 0);
+  const frac = Math.max(0, side.baseHp/side.baseMax);
+  const bw = WORLD.BASE_W*s, bh = 150*s;
+  const bx = p.sx, by = LAY.unitY;
+
+  ctx.save();
+  /* structure */
+  ctx.fillStyle = '#181d28';
+  rr(bx, by-bh, bw, bh, 4*s); ctx.fill();
+  ctx.fillStyle = '#232a38';
+  rr(bx+3*s, by-bh+3*s, bw-6*s, bh-6*s, 3*s); ctx.fill();
+
+  /* windows */
+  for (let r2=0;r2<5;r2++) for (let c=0;c<2;c++) {
+    const lit = frac > (r2+1)/6;
+    ctx.fillStyle = lit ? (isPlayer ? 'rgba(120,220,255,0.95)' : 'rgba(255,120,110,0.95)')
+                        : 'rgba(255,255,255,0.07)';
+    ctx.fillRect(bx + (10+c*22)*s, by - (26+r2*26)*s, 12*s, 14*s);
+  }
+  /* core */
+  const coreY = by - bh*0.86;
+  const pulse = 0.6 + 0.4*Math.sin(G.t*3);
+  const cc = isPlayer ? '#6fd8ff' : '#ff7b6f';
+  ctx.shadowBlur = 18*pulse; ctx.shadowColor = cc;
+  ctx.fillStyle = frac > 0.3 ? cc : '#ff5c4d';
+  ctx.beginPath(); ctx.arc(bx+bw/2, coreY, 9*s, 0, 6.29); ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.beginPath(); ctx.arc(bx+bw/2, coreY, 4*s*pulse, 0, 6.29); ctx.fill();
+
+  /* damage state */
+  if (frac < 0.66) {
+    ctx.strokeStyle = 'rgba(0,0,0,0.55)'; ctx.lineWidth = 1.4*s;
+    ctx.beginPath(); ctx.moveTo(bx+bw*0.2, by-bh*0.8); ctx.lineTo(bx+bw*0.5, by-bh*0.45);
+    ctx.lineTo(bx+bw*0.35, by-bh*0.2); ctx.stroke();
+  }
+  if (frac < 0.33 && !REDUCED) {
+    for (let i=0;i<4;i++) {
+      const t2 = (G.t*0.7 + i*0.37) % 1;
+      ctx.globalAlpha = (1-t2)*0.34;
+      ctx.fillStyle = '#8a8a96';
+      ctx.beginPath(); ctx.arc(bx + bw*(0.3+i*0.15), by - bh - t2*70*s, (5+i*2)*s*(1+t2), 0, 6.29); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+
+  /* hp bar */
+  const barW = bw*1.5, barX = bx + bw/2 - barW/2, barY = by - bh - 16*s;
+  bar(barX, barY, barW, 7*s, frac, isPlayer?'#4fd08a':'#ff6b5c', 'rgba(0,0,0,0.6)');
+  txt(Math.ceil(side.baseHp), bx+bw/2, barY-4*s, Math.max(8, 9*s*1.5),
+      'rgba(255,255,255,0.85)', 'center', 800);
+}
+
+/* ═══ BATTLE HUD ═══════════════════════════════════════════════════════ */
+function drawBattleHUD() {
+  const B = G.battle; if (!B) return;
+  const pad = Math.max(12, W*0.03);
+
+  /* top bar */
+  ctx.fillStyle = 'rgba(6,8,14,0.62)';
+  ctx.fillRect(0, 0, W, Math.max(46, H*0.072));
+
+  txt('IRONLINE', pad, Math.max(30, H*0.045), Math.max(11, Math.min(W*0.032, 15)),
+      'rgba(255,255,255,0.32)', 'left', 900);
+
+  const m = Math.floor(Math.max(0,B.time)/60), sec = Math.floor(Math.max(0,B.time)%60);
+  const urgent = B.time < 30;
+  txt(`${m}:${String(sec).padStart(2,'0')}`, W/2, Math.max(32, H*0.048),
+      Math.max(17, Math.min(W*0.055, 26)), urgent ? '#ff7b6b' : '#fff', 'center', 900);
+  if (B.double) txt('DOUBLE ELIXIR', W/2, Math.max(45, H*0.066), Math.max(9, Math.min(W*0.026, 12)),
+      '#ffd97a', 'center', 800);
+  txt(B.mission.foe.toUpperCase(), W-pad, Math.max(30, H*0.045),
+      Math.max(10, Math.min(W*0.028, 13)), 'rgba(255,255,255,0.42)', 'right', 800);
+  txt(B.mission.name, W-pad, Math.max(44, H*0.064),
+      Math.max(9, Math.min(W*0.024, 11)), 'rgba(255,255,255,0.24)', 'right', 700);
+
+  /* elixir */
+  const ey = LAY.cardY - 13;
+  const ew = W - pad*2;
+  bar(pad, ey, ew, 8, B.p.elixir/B.p.elixirMax, '#c85cff', 'rgba(255,255,255,0.10)');
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  for (let i=1;i<CFG.ELIXIR_MAX;i++) ctx.fillRect(pad + ew*(i/CFG.ELIXIR_MAX) - 1, ey, 2, 8);
+  txt(Math.floor(B.p.elixir)+' / '+CFG.ELIXIR_MAX, pad+ew+2, ey+8,
+      Math.max(9, Math.min(W*0.024,11)), 'rgba(255,255,255,0.5)', 'left', 800);
+
+  /* cards */
+  for (let i=0;i<LAY.cards.length;i++) {
+    const r = LAY.cards[i], key = B.p.hand[i], d = U[key];
+    if (!d) continue;
+    const afford = d.cost <= B.p.elixir;
+    const sel = G.selCard === i;
+    ctx.fillStyle = sel ? 'rgba(90,190,255,0.30)' : (afford ? 'rgba(20,24,36,0.94)' : 'rgba(14,16,24,0.88)');
+    rr(r.x, r.y, r.w, r.h, 9); ctx.fill();
+    ctx.strokeStyle = sel ? '#6fd8ff' : (afford ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.05)');
+    ctx.lineWidth = sel ? 2.4 : 1.2;
+    rr(r.x, r.y, r.w, r.h, 9); ctx.stroke();
+
+    ctx.globalAlpha = afford ? 1 : 0.42;
+    /* unit icon */
+    const iy = r.y + r.h*0.40, ix = r.x + r.w/2;
+    const iconR = Math.min(r.w*0.28, r.h*0.26);
+    ctx.save(); ctx.translate(ix, iy + iconR*0.9); ctx.scale(iconR/10, iconR/10);
+    drawUnitIcon(d, ctx);
+    ctx.restore();
+
+    txt(d.name.toUpperCase(), r.x+r.w/2, r.y+r.h-14, Math.max(8, Math.min(r.w*0.115, 11)),
+        afford ? '#e8ecf4' : '#6a7180', 'center', 800);
+    /* cost */
+    ctx.fillStyle = afford ? '#c85cff' : '#5a4268';
+    ctx.beginPath(); ctx.arc(r.x+r.w-11, r.y+11, 9, 0, 6.29); ctx.fill();
+    txt(String(d.cost), r.x+r.w-11, r.y+15, 11, '#fff', 'center', 900);
+    ctx.globalAlpha = 1;
+  }
+
+  /* next card */
+  const nc = B.p.queue[0];
+  if (nc) txt('NEXT  '+U[nc].name.toUpperCase(), W/2, LAY.cardY - 20,
+      Math.max(8, Math.min(W*0.022,10)), 'rgba(255,255,255,0.28)', 'center', 800);
+
+  /* base hp bars for player (bottom of field) */
+  const fy = LAY.field.y + LAY.field.h - 4;
+  bar(LAY.field.x, fy, LAY.field.w*0.4, 5, B.p.baseHp/B.p.baseMax, '#4fd08a', 'rgba(0,0,0,0.5)');
+
+  /* over overlay */
+  if (B.over) {
+    ctx.fillStyle = 'rgba(6,8,14,'+Math.min(0.72, B.overT*0.9)+')';
+    ctx.fillRect(0,0,W,H);
+    const win = B.playerWon;
+    txt(win ? 'LINE BROKEN' : 'LINE HELD', W/2, H*0.46,
+        Math.max(22, Math.min(W*0.085, 42)), win ? '#7dffb0' : '#ff7b6b', 'center', 900);
+  }
+  if (G.selCard >= 0) {
+    const d = U[B.p.hand[G.selCard]];
+    txt('TAP THE FIELD TO DEPLOY '+d.name.toUpperCase(), W/2, LAY.field.y - 10,
+        Math.max(9, Math.min(W*0.026,12)), '#6fd8ff', 'center', 800);
+  }
+}
+
+/* small icon for cards — reuses the silhouette shapes */
+function drawUnitIcon(d, c) {
+  c.fillStyle = d.col;
+  const R = 10;
+  switch (d.shape) {
+    case 'runner': c.beginPath(); c.arc(0,-R*1.5,R*0.9,0,6.29); c.fill();
+      c.fillRect(-R*0.7,-R*1.0,R*1.4,R*1.6); break;
+    case 'rifle': c.beginPath(); c.arc(0,-R*1.5,R*0.85,0,6.29); c.fill();
+      c.fillRect(-R*0.75,-R*1.0,R*1.5,R*1.6); c.fillRect(0,-R*1.1,R*1.7,R*0.35); break;
+    case 'shield': c.fillRect(-R*0.9,-R*1.9,R*1.8,R*2.6); c.fillRect(R*0.7,-R*2.0,R*0.9,R*2.7); break;
+    case 'drone': c.beginPath(); c.moveTo(0,-R*2); c.lineTo(R*1.5,-R*1); c.lineTo(0,0); c.lineTo(-R*1.5,-R*1); c.closePath(); c.fill(); break;
+    case 'gren': c.beginPath(); c.arc(0,-R*1.7,R*0.8,0,6.29); c.fill();
+      c.fillRect(-R*0.9,-R*1.2,R*1.8,R*1.3); c.fillRect(R*0.4,-R*1.0,R*1.4,R*0.5); break;
+    case 'sniper': c.beginPath(); c.arc(0,-R*1.6,R*0.7,0,6.29); c.fill();
+      c.fillRect(-R*0.55,-R*1.1,R*1.1,R*1.8); c.fillRect(0,-R*1.0,R*2.6,R*0.3); break;
+    case 'medic': c.fillRect(-R*0.75,-R*1.8,R*1.5,R*2.4);
+      c.fillStyle='#0d2a14'; c.fillRect(-R*0.16,-R*1.5,R*0.32,R*1.5); c.fillRect(-R*0.6,-R*1.05,R*1.2,R*0.32); break;
+    case 'mech': c.fillRect(-R*1.1,-R*2.0,R*2.2,R*1.8);
+      c.fillRect(-R*0.95,-R*0.3,R*0.6,R*1.0); c.fillRect(R*0.35,-R*0.3,R*0.6,R*1.0);
+      c.fillStyle='#fff08a'; c.fillRect(-R*0.75,-R*1.6,R*1.5,R*0.35); break;
+    case 'mortar': c.beginPath(); c.moveTo(-R*1.1,0); c.lineTo(R*1.4,-R*0.5); c.lineTo(R*1.4,-R*1.1); c.lineTo(-R*1.1,-R*0.9); c.closePath(); c.fill(); break;
+    case 'spell': c.beginPath(); c.arc(0,-R*1.2,R*1.1,0,6.29); c.fill();
+      c.strokeStyle=d.col; c.lineWidth=1.6; c.beginPath(); c.arc(0,-R*1.2,R*1.8,0,6.29); c.stroke(); break;
+  }
+}
+
+/* ═══ SCREENS ══════════════════════════════════════════════════════════ */
+function bgGrad(c1,c2,c3) {
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,c1); g.addColorStop(0.5,c2); g.addColorStop(1,c3);
+  ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+}
+function button(r, label, col, sub, enabled) {
+  const on = enabled !== false;
+  ctx.globalAlpha = on ? 1 : 0.4;
+  ctx.fillStyle = 'rgba(18,22,34,0.92)';
+  rr(r.x, r.y, r.w, r.h, 10); ctx.fill();
+  ctx.strokeStyle = col; ctx.lineWidth = 2; rr(r.x, r.y, r.w, r.h, 10); ctx.stroke();
+  txt(label, r.x+r.w/2, r.y + (sub ? r.h*0.44 : r.h*0.58), Math.min(r.h*0.30, r.w*0.10), col, 'center', 900);
+  if (sub) txt(sub, r.x+r.w/2, r.y+r.h*0.74, Math.min(r.h*0.19, r.w*0.06), 'rgba(255,255,255,0.45)', 'center', 700);
+  ctx.globalAlpha = 1;
+}
+
+function drawMenu() {
+  bgGrad('#0a0d18','#131a2c','#1d2740');
+
+  /* animated tower silhouettes */
+  ctx.save();
+  for (let i=0;i<7;i++) {
+    const x = (i/6)*W + Math.sin(G.t*0.3 + i)*8;
+    const h = (60 + ((i*37)%110)) * (H/700);
+    ctx.fillStyle = 'rgba(255,255,255,0.028)';
+    ctx.fillRect(x-30, H*0.72-h, 60, h+80);
+  }
+  ctx.restore();
+
+  const cy = H*0.30;
+  txt('IRONLINE', W/2, cy, Math.min(W*0.135, 62), '#fff', 'center', 900);
+  txt('REAL-TIME LANE WAR', W/2, cy + Math.min(W*0.085, 34), Math.min(W*0.036, 15),
+      '#6fd8ff', 'center', 800);
+
+  const cards = Math.min(SAVE.owned.length, ALL_UNITS.length);
+  txt(`${SAVE.cleared}/12 MISSIONS CLEARED   ·   ${SAVE.gold} GOLD   ·   ${cards} UNITS`, W/2, cy + Math.min(W*0.13, 56),
+      Math.min(W*0.030, 12), 'rgba(255,255,255,0.42)', 'center', 700);
+  if (SAVE.streak > 1) txt(`${SAVE.streak} DAY STREAK`, W/2, cy + Math.min(W*0.16, 74),
+      Math.min(W*0.030, 12), '#ffd97a', 'center', 800);
+
+  const bw = Math.min(W*0.72, 340), bh = Math.max(50, H*0.072), bx = (W-bw)/2;
+  let by = H*0.52;
+  G._menuBtns = [];
+  const items = [
+    ['CAMPAIGN', SAVE.cleared>0 ? `MISSION ${SAVE.cleared+1} NEXT` : 'BEGIN THE WAR', '#6fd8ff',
+      () => { G.scene = 'map'; G.mapScroll = 0; }],
+    ['ARSENAL', `${SAVE.owned.length} UNITS · ${SAVE.gold} GOLD`, '#ffd97a', () => { G.scene = 'arsenal'; }],
+    ['CODEX', 'EVERY UNIT AND ITS COUNTER', '#9dffb0', () => { G.scene = 'codex'; }],
+  ];
+  for (const [label, sub, col, act] of items) {
+    const r = { x:bx, y:by, w:bw, h:bh };
+    button(r, label, col, sub);
+    G._menuBtns.push({ ...r, act });
+    by += bh + 12;
+  }
+  txt('M  —  mute', W/2, H-16, Math.min(W*0.026,11), 'rgba(255,255,255,0.22)', 'center', 700);
+}
+
+function drawMap() {
+  bgGrad('#0a0d18','#12182a','#1a2238');
+  txt('CAMPAIGN', W/2, Math.max(38, H*0.06), Math.min(W*0.062, 27), '#fff', 'center', 900);
+
+  const back = { x:14, y:14, w:64, h:36 };
+  G._mapBtns = [{ ...back, act: () => { G.scene = 'menu'; } }];
+  ctx.fillStyle='rgba(255,255,255,0.08)'; rr(back.x,back.y,back.w,back.h,8); ctx.fill();
+  txt('MENU', back.x+back.w/2, back.y+23, 11, 'rgba(255,255,255,0.7)', 'center', 800);
+
+  const top = Math.max(70, H*0.11);
+  const cardH = Math.max(74, Math.min(H*0.115, 104));
+  const gap = 10;
+  const visH = H - top - 18;
+  const contentH = CAMPAIGN.length*(cardH+gap);
+  const maxScroll = Math.max(0, contentH - visH);
+  G.mapScroll = Math.max(0, Math.min(maxScroll, G.mapScroll||0));
+
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, top, W, visH); ctx.clip();
+  const pad = Math.max(14, W*0.05);
+  for (let i=0;i<CAMPAIGN.length;i++) {
+    const m = CAMPAIGN[i];
+    const y = top + i*(cardH+gap) - G.mapScroll;
+    if (y > H || y+cardH < top-20) continue;
+    const unlocked = i <= SAVE.cleared;
+    const done = i < SAVE.cleared;
+    const th = THEMES[m.theme];
+    const r = { x:pad, y, w:W-pad*2, h:cardH };
+
+    ctx.fillStyle = unlocked ? 'rgba(18,22,34,0.94)' : 'rgba(12,14,20,0.8)';
+    rr(r.x,r.y,r.w,r.h,12); ctx.fill();
+    ctx.strokeStyle = done ? 'rgba(110,220,150,0.5)' : (unlocked ? th.accent+'99' : 'rgba(255,255,255,0.07)');
+    ctx.lineWidth = done ? 2 : 1.4; rr(r.x,r.y,r.w,r.h,12); ctx.stroke();
+
+    /* theme swatch */
+    const sw = r.x + 14, swy = r.y + 14, sws = Math.min(52, r.h-28);
+    const gr = ctx.createLinearGradient(sw, swy, sw, swy+sws);
+    gr.addColorStop(0, th.sky[0]); gr.addColorStop(1, th.sky[2]);
+    ctx.fillStyle = gr; rr(sw, swy, sws, sws, 6); ctx.fill();
+
+    const tx = sw + sws + 14;
+    txt(`${i+1}. ${m.name}`, tx, r.y + Math.min(26, r.h*0.30), Math.min(W*0.042, 17),
+        unlocked ? '#fff' : 'rgba(255,255,255,0.3)', 'left', 900);
+    txt(m.foe.toUpperCase(), tx, r.y + Math.min(44, r.h*0.50), Math.min(W*0.028, 11),
+        unlocked ? th.accent : 'rgba(255,255,255,0.2)', 'left', 800);
+    if (unlocked) {
+      txt(`${m.reward} GOLD` + (m.unlock ? `  ·  UNLOCKS ${U[m.unlock].name.toUpperCase()}` : ''),
+          tx, r.y + Math.min(62, r.h*0.72), Math.min(W*0.026, 10.5),
+          'rgba(255,255,255,0.42)', 'left', 700);
+      const stars = SAVE.missionStars[m.id] || 0;
+      txt('★'.repeat(stars) + '☆'.repeat(3-stars), r.x+r.w-16, r.y + Math.min(26, r.h*0.30),
+          Math.min(W*0.032, 13), stars>0 ? '#ffd97a' : 'rgba(255,255,255,0.16)', 'right', 800);
+    } else {
+      txt('LOCKED', r.x+r.w-16, r.y+Math.min(30, r.h*0.36), Math.min(W*0.028,11),
+          'rgba(255,255,255,0.2)', 'right', 800);
+    }
+    if (done) txt('CLEARED', r.x+r.w-16, r.y+r.h-14, Math.min(W*0.026,10), '#7dffb0', 'right', 800);
+
+    if (unlocked) G._mapBtns.push({ ...r, act: () => startBattle(i) });
+  }
+  ctx.restore();
+
+  if (maxScroll > 0) {
+    const trackH = visH, thumbH = Math.max(30, visH*(visH/contentH));
+    const th2 = (G.mapScroll/maxScroll)*(trackH-thumbH);
+    ctx.fillStyle = 'rgba(255,255,255,0.12)';
+    rr(W-6, top+th2, 3, thumbH, 2); ctx.fill();
+  }
+}
+
+function drawArsenal() {
+  bgGrad('#0d0a18','#171128','#221838');
+  txt('ARSENAL', W/2, Math.max(38, H*0.055), Math.min(W*0.062, 27), '#fff', 'center', 900);
+  const avg = deckAvgCost();
+  const avgCol = avg > 3.8 ? '#ff9a9a' : (avg < 2.6 ? '#ffd97a' : '#9dffb0');
+  txt(`DECK ${SAVE.deck.length}/${CFG.DECK_SIZE}   ·   AVG ${avg.toFixed(1)} ELIXIR   ·   ${SAVE.gold} GOLD`,
+      W/2, Math.max(56, H*0.085), Math.min(W*0.030, 12), avgCol, 'center', 800);
+  txt('TAP A UNIT TO ADD OR REMOVE IT FROM YOUR DECK',
+      W/2, Math.max(72, H*0.108), Math.min(W*0.024, 10), 'rgba(255,255,255,0.30)', 'center', 700);
+
+  const back = { x:14, y:14, w:64, h:36 };
+  G._arsBtns = [{ ...back, act: () => { G.scene='menu'; } }];
+  ctx.fillStyle='rgba(255,255,255,0.08)'; rr(back.x,back.y,back.w,back.h,8); ctx.fill();
+  txt('MENU', back.x+back.w/2, back.y+23, 11, 'rgba(255,255,255,0.7)', 'center', 800);
+
+  const top = Math.max(96, H*0.132);
+  const rowH = Math.max(60, Math.min(H*0.098, 84)), gap = 8;
+  const visH = H - top - 14;
+  const contentH = SAVE.owned.length*(rowH+gap);
+  const maxScroll = Math.max(0, contentH - visH);
+  G.arsScroll = Math.max(0, Math.min(maxScroll, G.arsScroll||0));
+
+  ctx.save(); ctx.beginPath(); ctx.rect(0, top, W, visH); ctx.clip();
+  const pad = Math.max(14, W*0.05);
+  const rowToggles = [];
+  for (let i=0;i<SAVE.owned.length;i++) {
+    const key = SAVE.owned[i], d = U[key], lv = SAVE.lvl(key);
+    const inDeck = deckHas(key);
+    const y = top + i*(rowH+gap) - G.arsScroll;
+    if (y > H || y+rowH < top-20) continue;
+    const r = { x:pad, y, w:W-pad*2, h:rowH };
+    ctx.fillStyle = inDeck ? 'rgba(22,32,26,0.96)' : 'rgba(18,22,34,0.90)';
+    rr(r.x,r.y,r.w,r.h,11); ctx.fill();
+    ctx.strokeStyle = inDeck ? 'rgba(125,255,176,0.55)' : 'rgba(255,255,255,0.10)';
+    ctx.lineWidth = inDeck ? 2 : 1.3; rr(r.x,r.y,r.w,r.h,11); ctx.stroke();
+    /* deck marker stripe */
+    if (inDeck) { ctx.fillStyle='#7dffb0'; rr(r.x+3, r.y+8, 3, rowH-16, 1.5); ctx.fill(); }
+
+    const ir = Math.min(rowH*0.32, 24), ix = r.x + 16 + ir, iy = r.y + rowH/2;
+    ctx.save(); ctx.translate(ix, iy+ir*0.5); ctx.scale(ir/10, ir/10); drawUnitIcon(d, ctx); ctx.restore();
+
+    const tx = ix + ir + 14;
+    txt(d.name.toUpperCase(), tx, r.y+Math.min(24,rowH*0.30), Math.min(W*0.038,16), '#fff','left',900);
+    /* level pips */
+    for (let k=0;k<CFG.MAX_UNIT_LEVEL;k++) {
+      ctx.fillStyle = k < lv ? '#ffd97a' : 'rgba(255,255,255,0.13)';
+      rr(tx + k*13, r.y + Math.min(32,rowH*0.42), 10, 5, 2.5); ctx.fill();
+    }
+    txt(`LV ${lv}   ·   ${Math.round(d.hp*(1+(lv-1)*CFG.UPGRADE_GAIN))} HP   ·   ${d.dmg?Math.round(d.dmg*(1+(lv-1)*CFG.UPGRADE_GAIN))+' DMG':'SUPPORT'}   ·   ${d.cost} ELIXIR`,
+        tx, r.y + rowH - 12, Math.min(W*0.024,10.5), 'rgba(255,255,255,0.42)','left',700);
+
+    /* IN DECK badge sits top-right, above the upgrade button */
+    txt(inDeck ? 'IN DECK' : 'TAP TO ADD', r.x+r.w-16, r.y+15, Math.min(W*0.022,9.5),
+        inDeck ? '#7dffb0' : 'rgba(255,255,255,0.30)', 'right', 900);
+
+    if (lv < CFG.MAX_UNIT_LEVEL) {
+      const cost = CFG.UPGRADE_COST[lv];
+      const can = SAVE.gold >= cost;
+      const br = { x:r.x+r.w-Math.min(96,r.w*0.26)-12, y:r.y+rowH/2-14, w:Math.min(96,r.w*0.26), h:30 };
+      ctx.fillStyle = can ? 'rgba(255,217,122,0.16)' : 'rgba(255,255,255,0.04)';
+      rr(br.x,br.y,br.w,br.h,7); ctx.fill();
+      ctx.strokeStyle = can ? '#ffd97a' : 'rgba(255,255,255,0.10)'; ctx.lineWidth=1.4;
+      rr(br.x,br.y,br.w,br.h,7); ctx.stroke();
+      txt('LV UP  '+cost+'g', br.x+br.w/2, br.y+20, Math.min(11, br.w*0.13), can?'#ffd97a':'rgba(255,255,255,0.3)','center',900);
+      if (can) G._arsBtns.push({ ...br, act: () => {
+        SAVE.gold -= cost; SAVE.levels[key] = lv+1; SAVE.save(); toast(d.name+' → LV '+(lv+1), '#ffd97a');
+      }});
+    } else {
+      txt('MAXED', r.x+r.w-40, r.y+rowH/2+5, 11, 'rgba(125,255,176,0.8)','center',900);
+    }
+    rowToggles.push({ ...r, act: () => toggleDeck(key) });
+  }
+  ctx.restore();
+  /* row toggles are pushed last so the upgrade buttons keep priority */
+  G._arsBtns.push(...rowToggles);
+}
+
+function drawCodex() {
+  bgGrad('#08120c','#0e1c14','#14261a');
+  txt('CODEX', W/2, Math.max(38, H*0.055), Math.min(W*0.062, 27), '#fff','center',900);
+  txt('WHAT BEATS WHAT', W/2, Math.max(56, H*0.083), Math.min(W*0.028,11),
+      'rgba(157,255,176,0.7)','center',800);
+
+  const back = { x:14, y:14, w:64, h:36 };
+  G._codBtns = [{ ...back, act: () => { G.scene='menu'; } }];
+  ctx.fillStyle='rgba(255,255,255,0.08)'; rr(back.x,back.y,back.w,back.h,8); ctx.fill();
+  txt('MENU', back.x+back.w/2, back.y+23, 11, 'rgba(255,255,255,0.7)','center',800);
+
+  const top = Math.max(80, H*0.105);
+  const rowH = Math.max(66, Math.min(H*0.105, 92)), gap = 8;
+  const visH = H - top - 14;
+  const contentH = ALL_UNITS.length*(rowH+gap);
+  const maxScroll = Math.max(0, contentH - visH);
+  G.codScroll = Math.max(0, Math.min(maxScroll, G.codScroll||0));
+
+  ctx.save(); ctx.beginPath(); ctx.rect(0, top, W, visH); ctx.clip();
+  const pad = Math.max(14, W*0.05);
+  for (let i=0;i<ALL_UNITS.length;i++) {
+    const key = ALL_UNITS[i], d = U[key];
+    const owned = SAVE.owned.includes(key);
+    const y = top + i*(rowH+gap) - G.codScroll;
+    if (y > H || y+rowH < top-20) continue;
+    const r = { x:pad, y, w:W-pad*2, h:rowH };
+    ctx.fillStyle = owned ? 'rgba(16,22,18,0.94)' : 'rgba(12,14,14,0.8)';
+    rr(r.x,r.y,r.w,r.h,11); ctx.fill();
+    ctx.strokeStyle = owned ? d.col+'66' : 'rgba(255,255,255,0.06)';
+    ctx.lineWidth=1.4; rr(r.x,r.y,r.w,r.h,11); ctx.stroke();
+
+    const ir = Math.min(rowH*0.30, 22), ix = r.x + 16 + ir, iy = r.y + 26;
+    ctx.globalAlpha = owned ? 1 : 0.3;
+    ctx.save(); ctx.translate(ix, iy+ir*0.5); ctx.scale(ir/10, ir/10); drawUnitIcon(d, ctx); ctx.restore();
+    ctx.globalAlpha = 1;
+
+    txt(d.name.toUpperCase(), ix+ir+12, r.y+Math.min(24,rowH*0.28), Math.min(W*0.036,15),
+        owned ? '#fff' : 'rgba(255,255,255,0.35)','left',900);
+    txt(d.cost+' ELIXIR', r.x+r.w-16, r.y+Math.min(22,rowH*0.26), Math.min(W*0.026,10.5),
+        '#c85cff','right',800);
+    txt(d.blurb, ix+ir+12, r.y+Math.min(44,rowH*0.50), Math.min(W*0.026,11),
+        owned ? 'rgba(255,255,255,0.55)' : 'rgba(255,255,255,0.18)','left',600);
+    if (!owned) txt('NOT YET UNLOCKED', ix+ir+12, r.y+rowH-11, Math.min(W*0.024,10),
+        'rgba(255,255,255,0.25)','left',800);
+    else txt(`${d.hp} HP  ·  ${d.dmg||0} DMG  ·  ${d.speed} SPD  ·  ${d.range} RNG`,
+        ix+ir+12, r.y+rowH-11, Math.min(W*0.024,10), 'rgba(255,255,255,0.34)','left',700);
+  }
+  ctx.restore();
+}
+
+function drawResult() {
+  const R = G.result; if (!R) return;
+  const won = R.won;
+  bgGrad(won?'#07160f':'#1a0a0c', won?'#0d2418':'#2a1014', won?'#133020':'#3a1518');
+
+  const cy = H*0.20;
+  txt(won?'VICTORY':'DEFEAT', W/2, cy, Math.min(W*0.12, 54), won?'#7dffb0':'#ff7b6b','center',900);
+  txt(R.mission.name, W/2, cy+Math.min(W*0.07,30), Math.min(W*0.036,15),
+      'rgba(255,255,255,0.6)','center',800);
+  txt(won?`${R.mission.foe} BROKEN`:`${R.mission.foe} HELD THE LINE`, W/2, cy+Math.min(W*0.10,46),
+      Math.min(W*0.028,11.5), 'rgba(255,255,255,0.35)','center',700);
+
+  const sy = H*0.40;
+  const stats = [
+    ['CORE LEFT', Math.round(100*R.baseLeft/R.baseMax)+'%'],
+    ['UNITS SENT', R.stats.units],
+    ['DAMAGE', Math.round(R.stats.dmg)],
+    ['KILLS', R.stats.kills],
+  ];
+  const cw = W/4;
+  stats.forEach(([l,v],i) => {
+    const x = cw*i + cw/2;
+    txt(l, x, sy, Math.min(W*0.024,10), 'rgba(255,255,255,0.34)','center',800);
+    txt(String(v), x, sy+Math.min(W*0.052,24), Math.min(W*0.042,18), '#fff','center',900);
+  });
+
+  if (won) {
+    const ry = sy + Math.min(W*0.10, 48);
+    txt(`+${R.mission.reward} GOLD`, W/2, ry, Math.min(W*0.05,21), '#ffd97a','center',900);
+    if (R.mission.unlock && SAVE.owned.includes(R.mission.unlock))
+      txt(`UNLOCKED  ${U[R.mission.unlock].name.toUpperCase()}`, W/2, ry+Math.min(W*0.05,22),
+          Math.min(W*0.036,15), '#9dffb0','center',900);
+  } else {
+    txt('THEIR CORE SURVIVED', W/2, sy+Math.min(W*0.10,48), Math.min(W*0.036,15),
+        'rgba(255,123,107,0.8)','center',800);
+  }
+
+  const bw = Math.min(W*0.72, 340), bh = Math.max(48, H*0.068), bx=(W-bw)/2;
+  let by = H*0.66;
+  G._resBtns = [];
+  const nextId = R.mission.id + 1;
+  const acts = [];
+  if (won && nextId < CAMPAIGN.length) acts.push(['NEXT MISSION', 'FIGHT '+CAMPAIGN[nextId].name, '#7dffb0', () => startBattle(nextId)]);
+  acts.push(['RETRY', won?'FIGHT IT AGAIN':'TRY AGAIN', '#6fd8ff', () => startBattle(R.mission.id)]);
+  acts.push(['ARSENAL', SAVE.gold+' GOLD TO SPEND', '#ffd97a', () => { G.scene='arsenal'; }]);
+  acts.push(['CAMPAIGN', 'BACK TO THE MAP', 'rgba(255,255,255,0.6)', () => { G.scene='map'; }]);
+  for (const [label, sub, col, act] of acts) {
+    const r = { x:bx, y:by, w:bw, h:bh };
+    button(r, label, col, sub); G._resBtns.push({ ...r, act });
+    by += bh + 9;
+  }
+}
+
+/* ═══ MAIN LOOP ════════════════════════════════════════════════════════ */
+let last = performance.now();
+function frame(now) {
+  let dt = (now - last)/1000; last = now;
+  if (dt > 0.05) dt = 0.05;
+  G.t += dt;
+  G.scroll += dt * 10;
+  if (G.toastT > 0) G.toastT -= dt;
+
+  /* weather drift */
+  for (const d of G.weather) {
+    d.y += d.v * dt * 0.55;
+    d.x += d.drift * dt * 0.12;
+    if (d.y > 1.05) { d.y = -0.05; d.x = Math.random(); }
+    if (d.x < -0.05) d.x = 1.05; if (d.x > 1.05) d.x = -0.05;
+  }
+
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+
+  if (G.scene === 'battle') {
+    if (G.hitstop > 0) { G.hitstop -= dt; }
+    else updateBattle(dt);
+    const B = G.battle;
+    ctx.save();
+    ctx.translate((Math.random()-0.5)*(B?B.shake:0), (Math.random()-0.5)*(B?B.shake:0));
+    drawBattle();
+    ctx.restore();
+    if (B && B.flash > 0.01) {
+      ctx.fillStyle = `rgba(255,240,200,${Math.min(0.45, B.flash*0.5)})`;
+      ctx.fillRect(0,0,W,H);
+    }
+    drawBattleHUD();
+  } else if (G.scene === 'menu') drawMenu();
+  else if (G.scene === 'map') drawMap();
+  else if (G.scene === 'arsenal') drawArsenal();
+  else if (G.scene === 'codex') drawCodex();
+  else if (G.scene === 'result') drawResult();
+
+  if (G.toastT > 0 && G.toast) {
+    const a = Math.min(1, G.toastT/0.4);
+    ctx.globalAlpha = a;
+    const tw = Math.min(W*0.8, 340);
+    ctx.fillStyle = 'rgba(10,12,18,0.92)';
+    rr((W-tw)/2, H*0.13, tw, 34, 8); ctx.fill();
+    ctx.strokeStyle = G.toast.col+'88'; ctx.lineWidth=1.4;
+    rr((W-tw)/2, H*0.13, tw, 34, 8); ctx.stroke();
+    txt(G.toast.msg, W/2, H*0.13+22, Math.min(W*0.03,12), G.toast.col, 'center', 800);
+    ctx.globalAlpha = 1;
+  }
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+document.addEventListener('visibilitychange', () => { last = performance.now(); });
+
+/* scroll on the map / arsenal / codex */
+cvs.addEventListener('wheel', e => {
+  e.preventDefault();
+  if (G.scene === 'map') G.mapScroll = (G.mapScroll||0) + e.deltaY*0.7;
+  else if (G.scene === 'arsenal') G.arsScroll = (G.arsScroll||0) + e.deltaY*0.7;
+  else if (G.scene === 'codex') G.codScroll = (G.codScroll||0) + e.deltaY*0.7;
+}, { passive:false });
+
+/* drag-to-scroll for the list screens */
+let dragPrev = null;
+cvs.addEventListener('pointermove', e => {
+  if (!pDown) { dragPrev = null; return; }
+  if (G.scene === 'battle') return;
+  if (Math.hypot(e.clientX-pDown.x, e.clientY-pDown.y) < 10) return;   // dead zone
+  if (dragPrev === null) dragPrev = e.clientY;
+  const dy = dragPrev - e.clientY;
+  if (G.scene === 'map') G.mapScroll = (G.mapScroll||0) + dy;
+  else if (G.scene === 'arsenal') G.arsScroll = (G.arsScroll||0) + dy;
+  else if (G.scene === 'codex') G.codScroll = (G.codScroll||0) + dy;
+  dragPrev = e.clientY;
+}, { passive:true });
+cvs.addEventListener('pointerup', () => { dragPrev = null; }, { passive:true });
+
+/* ═══ TEST HOOK ═════════════════════════════════════════════════════════ */
+if (typeof window !== 'undefined') {
+  window.__IRONLINE__ = { G, CFG, U, SAVE, CAMPAIGN, startBattle, updateBattle, spawn,
+                          playerDeploy, aiUpdate, ALL_UNITS, WORLD, tap, LAY, makeSide,
+                          toggleDeck, deckAvgCost, endBattle, THEMES };
+}
+
+})();
+</script>
+</body>
+</html>
